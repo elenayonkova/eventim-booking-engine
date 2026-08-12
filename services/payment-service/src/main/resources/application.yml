@@ -1,0 +1,24 @@
+server:
+  port: ${SERVER_PORT:8081}
+
+spring:
+  application:
+    name: payment-service
+  datasource:
+    url: ${SPRING_DATASOURCE_URL:jdbc:postgresql://localhost:5432/eventim?currentSchema=payment}
+    username: ${SPRING_DATASOURCE_USERNAME:eventim}
+    password: ${SPRING_DATASOURCE_PASSWORD:eventim}
+  flyway:
+    schemas: payment
+    default-schema: payment
+    create-schemas: true
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  endpoint:
+    health:
+      probes:
+        enabled: true

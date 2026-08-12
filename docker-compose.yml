@@ -1,0 +1,20 @@
+services:
+  postgres:
+    image: postgres:17
+    container_name: eventim-postgres
+    environment:
+      POSTGRES_DB: eventim
+      POSTGRES_USER: eventim
+      POSTGRES_PASSWORD: eventim
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U eventim -d eventim"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+volumes:
+  postgres-data:
