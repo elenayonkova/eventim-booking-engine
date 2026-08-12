@@ -11,6 +11,6 @@ public record PaymentRequest(
         @NotNull UUID reservationId,
         @Positive long amount,
         @NotBlank @Size(min = 3, max = 3) String currency,
-        @NotBlank String paymentMethodToken
+        @NotBlank @Size(max = 256) String paymentMethodToken
 ) {
 }

@@ -9,6 +9,7 @@ import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 
 import com.eventim.booking.engine.booking.service.ConflictException;
+import com.eventim.booking.engine.booking.service.ExternalServiceException;
 import com.eventim.booking.engine.booking.service.NotFoundException;
 
 @RestControllerAdvice
@@ -33,5 +34,17 @@ public class ApiExceptionHandler {
                 .collect(Collectors.joining("; "));
         return ResponseEntity.badRequest()
                 .body(ErrorResponse.of(400, "Bad Request", message));
+    }
+
+    @ExceptionHandler(IllegalArgumentException.class)
+    public ResponseEntity<ErrorResponse> invalidArgument(IllegalArgumentException exception) {
+        return ResponseEntity.badRequest()
+                .body(ErrorResponse.of(400, "Bad Request", exception.getMessage()));
+    }
+
+    @ExceptionHandler(ExternalServiceException.class)
+    public ResponseEntity<ErrorResponse> externalService(ExternalServiceException exception) {
+        return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
+                .body(ErrorResponse.of(503, "Service Unavailable", exception.getMessage()));
     }
 }

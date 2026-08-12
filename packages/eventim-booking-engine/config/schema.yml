@@ -1,0 +1,22 @@
+#@data/values-schema
+---
+namespace: eventim
+booking:
+  image: eventim/booking-service:dev
+  replicas: 2
+  holdTtl: 5m
+  expirySweepMs: 30000
+  paymentConnectTimeout: 2s
+  paymentReadTimeout: 10s
+  paymentPendingTimeout: 3m
+  paymentReconciliationSweepMs: 30000
+payment:
+  image: eventim/payment-service:dev
+  replicas: 2
+  recoverySweepMs: 30000
+postgres:
+  image: postgres:17-alpine
+  database: eventim
+  username: eventim
+  password: eventim
+  storage: 1Gi

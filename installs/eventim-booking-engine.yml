@@ -1,0 +1,48 @@
+#@ load("@ytt:data", "data")
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: eventim-install
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: eventim-package-values
+  namespace: eventim-install
+stringData:
+  values.yml: #@ "booking:\n  image: " + data.values.booking_image + "\npayment:\n  image: " + data.values.payment_image + "\n"
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: eventim-package-installer
+  namespace: eventim-install
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: eventim-package-installer
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+subjects:
+  - kind: ServiceAccount
+    name: eventim-package-installer
+    namespace: eventim-install
+---
+apiVersion: packaging.carvel.dev/v1alpha1
+kind: PackageInstall
+metadata:
+  name: eventim-booking-engine
+  namespace: eventim-install
+spec:
+  serviceAccountName: eventim-package-installer
+  values:
+    - secretRef:
+        name: eventim-package-values
+  packageRef:
+    refName: eventim-booking-engine.eventim.dev
+    versionSelection:
+      constraints: 0.1.0

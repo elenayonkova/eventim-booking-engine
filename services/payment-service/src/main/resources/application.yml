@@ -13,6 +13,9 @@ spring:
     default-schema: payment
     create-schemas: true
 
+payment:
+  recovery-sweep-ms: ${PAYMENT_RECOVERY_SWEEP_MS:30000}
+
 management:
   endpoints:
     web:

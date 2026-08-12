@@ -16,6 +16,11 @@ spring:
 booking:
   hold-ttl: ${BOOKING_HOLD_TTL:5m}
   expiry-sweep-ms: ${BOOKING_EXPIRY_SWEEP_MS:30000}
+  payment-base-url: ${PAYMENT_BASE_URL:http://localhost:8081}
+  payment-connect-timeout: ${PAYMENT_CONNECT_TIMEOUT:2s}
+  payment-read-timeout: ${PAYMENT_READ_TIMEOUT:10s}
+  payment-pending-timeout: ${PAYMENT_PENDING_TIMEOUT:3m}
+  payment-reconciliation-sweep-ms: ${PAYMENT_RECONCILIATION_SWEEP_MS:30000}
 
 management:
   endpoints:

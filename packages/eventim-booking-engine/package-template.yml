@@ -1,0 +1,73 @@
+#@ load("@ytt:data", "data")
+---
+apiVersion: data.packaging.carvel.dev/v1alpha1
+kind: PackageMetadata
+metadata:
+  name: eventim-booking-engine.eventim.dev
+  namespace: eventim-install
+spec:
+  displayName: Eventim Booking Engine
+  longDescription: High-concurrency seat reservation and simulated payment services.
+  shortDescription: Production-minded Eventim take-home implementation.
+  categories:
+    - booking
+---
+apiVersion: data.packaging.carvel.dev/v1alpha1
+kind: Package
+metadata:
+  name: eventim-booking-engine.eventim.dev.0.1.0
+  namespace: eventim-install
+spec:
+  refName: eventim-booking-engine.eventim.dev
+  version: 0.1.0
+  releasedAt: 2026-08-12T00:00:00Z
+  valuesSchema:
+    openAPIv3:
+      title: eventim-booking-engine.eventim.dev values schema
+      type: object
+      additionalProperties: false
+      properties:
+        namespace:
+          type: string
+          default: eventim
+        booking:
+          type: object
+          additionalProperties: false
+          properties:
+            image: {type: string, default: "eventim/booking-service:dev"}
+            replicas: {type: integer, default: 2, minimum: 1}
+            holdTtl: {type: string, default: "5m"}
+            expirySweepMs: {type: integer, default: 30000, minimum: 1000}
+            paymentConnectTimeout: {type: string, default: "2s"}
+            paymentReadTimeout: {type: string, default: "10s"}
+            paymentPendingTimeout: {type: string, default: "3m"}
+            paymentReconciliationSweepMs: {type: integer, default: 30000, minimum: 1000}
+        payment:
+          type: object
+          additionalProperties: false
+          properties:
+            image: {type: string, default: "eventim/payment-service:dev"}
+            replicas: {type: integer, default: 2, minimum: 1}
+            recoverySweepMs: {type: integer, default: 30000, minimum: 1000}
+        postgres:
+          type: object
+          additionalProperties: false
+          properties:
+            image: {type: string, default: "postgres:17-alpine"}
+            database: {type: string, default: "eventim"}
+            username: {type: string, default: "eventim"}
+            password: {type: string, default: "eventim"}
+            storage: {type: string, default: "1Gi"}
+  template:
+    spec:
+      fetch:
+        - inline:
+            paths:
+              config/schema.yml: #@ data.values.schema
+              config/workloads.yml: #@ data.values.workloads
+      template:
+        - ytt:
+            paths:
+              - config
+      deploy:
+        - kapp: {}

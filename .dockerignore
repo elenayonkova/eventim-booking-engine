@@ -1,0 +1,11 @@
+.git
+.idea
+**/target
+**/*.log
+.DS_Store
+packages
+installs
+scripts
+README.md
+DEMO.md
+docker-compose.yml

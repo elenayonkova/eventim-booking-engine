@@ -7,3 +7,8 @@ build/
 logs/
 *.log
 
+# Local submission and recording notes
+/DEMO.md
+/PRODUCTION_ENHANCEMENTS_NOTES.md
+/postman/
+/.postman/

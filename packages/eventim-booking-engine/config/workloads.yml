@@ -1,0 +1,370 @@
+#@ load("@ytt:data", "data")
+#@ namespace = data.values.namespace
+#@ app_labels = {"app.kubernetes.io/part-of": "eventim-booking-engine"}
+#@ def labels(name):
+app.kubernetes.io/name: #@ name
+app.kubernetes.io/part-of: eventim-booking-engine
+#@ end
+#@ def selector(name):
+app.kubernetes.io/name: #@ name
+#@ end
+#@ def spring_pod_security_context():
+runAsNonRoot: true
+runAsUser: 10001
+runAsGroup: 10001
+seccompProfile:
+  type: RuntimeDefault
+#@ end
+#@ def postgres_wait_container():
+name: wait-for-postgres
+image: #@ data.values.postgres.image
+imagePullPolicy: IfNotPresent
+command:
+  - sh
+  - -c
+  - until pg_isready -h postgres -U "$POSTGRES_USER" -d "$POSTGRES_DB"; do sleep 2; done
+env:
+  - name: POSTGRES_DB
+    valueFrom:
+      secretKeyRef:
+        name: eventim-database
+        key: database
+  - name: POSTGRES_USER
+    valueFrom:
+      secretKeyRef:
+        name: eventim-database
+        key: username
+resources:
+  requests:
+    cpu: 10m
+    memory: 16Mi
+  limits:
+    cpu: 100m
+    memory: 64Mi
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop: ["ALL"]
+#@ end
+#@ def spring_db_env(schema):
+#@   return [
+#@     {"name": "SPRING_DATASOURCE_URL", "value": "jdbc:postgresql://postgres:5432/{}?currentSchema={}".format(data.values.postgres.database, schema)},
+#@     {"name": "SPRING_DATASOURCE_USERNAME", "valueFrom": {"secretKeyRef": {"name": "eventim-database", "key": "username"}}},
+#@     {"name": "SPRING_DATASOURCE_PASSWORD", "valueFrom": {"secretKeyRef": {"name": "eventim-database", "key": "password"}}},
+#@   ]
+#@ end
+#@ def startup_probe():
+httpGet:
+  path: /actuator/health/liveness
+  port: http
+failureThreshold: 30
+periodSeconds: 2
+#@ end
+#@ def readiness_probe():
+httpGet:
+  path: /actuator/health/readiness
+  port: http
+periodSeconds: 5
+#@ end
+#@ def liveness_probe():
+httpGet:
+  path: /actuator/health/liveness
+  port: http
+periodSeconds: 10
+#@ end
+#@ def spring_resources():
+requests:
+  cpu: 100m
+  memory: 192Mi
+limits:
+  cpu: "1"
+  memory: 512Mi
+#@ end
+#@ def restricted_container_security_context(read_only_root=False):
+allowPrivilegeEscalation: false
+#@ if read_only_root:
+readOnlyRootFilesystem: true
+#@ end
+capabilities:
+  drop: ["ALL"]
+#@ end
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: #@ namespace
+  labels: #@ app_labels
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: eventim-database
+  namespace: #@ namespace
+  labels: #@ app_labels
+type: Opaque
+stringData:
+  database: #@ data.values.postgres.database
+  username: #@ data.values.postgres.username
+  password: #@ data.values.postgres.password
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: eventim-workload
+  namespace: #@ namespace
+  labels: #@ app_labels
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: #@ namespace
+  labels: #@ labels("postgres")
+spec:
+  selector: #@ selector("postgres")
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: #@ namespace
+  labels: #@ labels("postgres")
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels: #@ selector("postgres")
+  template:
+    metadata:
+      labels: #@ labels("postgres")
+    spec:
+      serviceAccountName: eventim-workload
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 70
+        runAsGroup: 70
+        fsGroup: 70
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: postgres
+          image: #@ data.values.postgres.image
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: postgres
+              containerPort: 5432
+          env:
+            - name: POSTGRES_DB
+              valueFrom:
+                secretKeyRef:
+                  name: eventim-database
+                  key: database
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: eventim-database
+                  key: username
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: eventim-database
+                  key: password
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -U $POSTGRES_USER -d $POSTGRES_DB"]
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -U $POSTGRES_USER -d $POSTGRES_DB"]
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: postgres-data
+              mountPath: /var/lib/postgresql/data
+  volumeClaimTemplates:
+    - metadata:
+        name: postgres-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: #@ data.values.postgres.storage
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: payment-service
+  namespace: #@ namespace
+  labels: #@ labels("payment-service")
+spec:
+  selector: #@ selector("payment-service")
+  ports:
+    - name: http
+      port: 8081
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payment-service
+  namespace: #@ namespace
+  labels: #@ labels("payment-service")
+spec:
+  replicas: #@ data.values.payment.replicas
+  strategy:
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels: #@ selector("payment-service")
+  template:
+    metadata:
+      labels: #@ labels("payment-service")
+    spec:
+      serviceAccountName: eventim-workload
+      securityContext: #@ spring_pod_security_context()
+      initContainers:
+        - #@ postgres_wait_container()
+      containers:
+        - name: payment-service
+          image: #@ data.values.payment.image
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8081
+          env:
+            #@ for env in spring_db_env("payment"):
+            - #@ env
+            #@ end
+            - name: PAYMENT_RECOVERY_SWEEP_MS
+              value: #@ str(data.values.payment.recoverySweepMs)
+          startupProbe: #@ startup_probe()
+          readinessProbe: #@ readiness_probe()
+          livenessProbe: #@ liveness_probe()
+          resources: #@ spring_resources()
+          securityContext: #@ restricted_container_security_context(True)
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: payment-service
+  namespace: #@ namespace
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels: #@ selector("payment-service")
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: booking-service
+  namespace: #@ namespace
+  labels: #@ labels("booking-service")
+spec:
+  selector: #@ selector("booking-service")
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: booking-service
+  namespace: #@ namespace
+  labels: #@ labels("booking-service")
+spec:
+  replicas: #@ data.values.booking.replicas
+  strategy:
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels: #@ selector("booking-service")
+  template:
+    metadata:
+      labels: #@ labels("booking-service")
+    spec:
+      serviceAccountName: eventim-workload
+      securityContext: #@ spring_pod_security_context()
+      initContainers:
+        - #@ postgres_wait_container()
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels: #@ selector("booking-service")
+      containers:
+        - name: booking-service
+          image: #@ data.values.booking.image
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            #@ for env in spring_db_env("booking"):
+            - #@ env
+            #@ end
+            - name: PAYMENT_BASE_URL
+              value: http://payment-service:8081
+            - name: BOOKING_HOLD_TTL
+              value: #@ data.values.booking.holdTtl
+            - name: BOOKING_EXPIRY_SWEEP_MS
+              value: #@ str(data.values.booking.expirySweepMs)
+            - name: PAYMENT_CONNECT_TIMEOUT
+              value: #@ data.values.booking.paymentConnectTimeout
+            - name: PAYMENT_READ_TIMEOUT
+              value: #@ data.values.booking.paymentReadTimeout
+            - name: PAYMENT_PENDING_TIMEOUT
+              value: #@ data.values.booking.paymentPendingTimeout
+            - name: PAYMENT_RECONCILIATION_SWEEP_MS
+              value: #@ str(data.values.booking.paymentReconciliationSweepMs)
+          startupProbe: #@ startup_probe()
+          readinessProbe: #@ readiness_probe()
+          livenessProbe: #@ liveness_probe()
+          resources: #@ spring_resources()
+          securityContext: #@ restricted_container_security_context(True)
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: booking-service
+  namespace: #@ namespace
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels: #@ selector("booking-service")

@@ -34,4 +34,10 @@ public class ApiExceptionHandler {
         return ResponseEntity.badRequest()
                 .body(ErrorResponse.of(400, "Bad Request", message));
     }
+
+    @ExceptionHandler(IllegalArgumentException.class)
+    public ResponseEntity<ErrorResponse> invalidArgument(IllegalArgumentException exception) {
+        return ResponseEntity.badRequest()
+                .body(ErrorResponse.of(400, "Bad Request", exception.getMessage()));
+    }
 }
