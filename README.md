@@ -23,7 +23,7 @@ reservation twice.
 - Docker Compose provides a quick local setup.
 - Carvel and kind provide a local Kubernetes setup with two copies of each
   service, health checks, resource limits, and persistent PostgreSQL storage.
-- Twelve integration tests cover concurrent reservations and payment edge cases.
+- Sixteen integration tests cover concurrent reservations and payment edge cases.
 
 ## Architecture
 
@@ -76,6 +76,12 @@ amount, currency, and payment-token fingerprint against the stored checkout.
 A successful mismatched payment is refunded instead of booking seats. The
 client can also retry the same checkout safely.
 
+If no payment is found after the reconciliation timeout, the Booking Service
+asks the Payment Service to cancel the reservation-scoped payment intent. The
+Payment Service serializes cancellation with payment creation and completion.
+Only a durable cancellation allows the seats to be released; if payment won
+the race, its final result is returned and applied instead.
+
 If payment succeeds but the seats cannot be booked, the reservation moves to
 `REFUND_REQUIRED`. The system then sends an idempotent refund request.
 
@@ -120,10 +126,12 @@ Payment Service (`:8081`, internal in Kubernetes):
 | --- | --- | --- |
 | `POST` | `/v1/payments` | Create a payment or return the existing payment |
 | `GET` | `/v1/payments/by-reservation/{reservationId}` | Find a payment during recovery |
+| `POST` | `/v1/payments/cancellations` | Prevent a late payment or return the payment that won the race |
 | `POST` | `/v1/refunds` | Create a refund or return the existing refund |
 | `GET` | `/actuator/health` | Check service health |
 
-Checkout accepts the required payment simulation headers:
+Checkout accepts the payment simulation headers while
+`PAYMENT_SIMULATION_ENABLED` is true:
 
 - `X-Simulate-Delay-Ms`: delay the payment response by up to 60,000 ms.
 - `X-Simulate-Failure: true`: return a failed payment.
@@ -198,7 +206,8 @@ setup should use smaller, pre-created permissions.
 
 ## Tests
 
-Docker must be running. The tests use Testcontainers and PostgreSQL 17.
+Docker must be running. The tests use Testcontainers and PostgreSQL 17, and the
+build fails rather than silently skipping the suites when Docker is unavailable.
 
 ```bash
 mvn test
@@ -213,6 +222,8 @@ The tests check that:
 - concurrent payment requests create only one payment;
 - the same payment key cannot be reused with different payment details;
 - mismatched recovered payments are refunded instead of booking seats;
+- cancellation tombstones prevent late payments after seats are released;
+- refund responses must match the stored reservation and payment;
 - stale recovery cannot be overwritten by late payment completion; and
 - excessive simulated delays are rejected before work starts.
 

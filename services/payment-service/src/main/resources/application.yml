@@ -15,6 +15,7 @@ spring:
 
 payment:
   recovery-sweep-ms: ${PAYMENT_RECOVERY_SWEEP_MS:30000}
+  simulation-enabled: ${PAYMENT_SIMULATION_ENABLED:true}
 
 management:
   endpoints:

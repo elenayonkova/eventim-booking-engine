@@ -25,12 +25,15 @@ import org.testcontainers.junit.jupiter.Testcontainers;
 
 import com.eventim.booking.engine.payment.api.PaymentRequest;
 import com.eventim.booking.engine.payment.api.PaymentResponse;
+import com.eventim.booking.engine.payment.api.PaymentCancellationRequest;
+import com.eventim.booking.engine.payment.api.PaymentCancellationResponse;
+import com.eventim.booking.engine.payment.api.RefundRequest;
 import com.eventim.booking.engine.payment.domain.PaymentStatus;
 import com.eventim.booking.engine.payment.repository.PaymentRepository;
 import com.eventim.booking.engine.payment.service.ConflictException;
 import com.eventim.booking.engine.payment.service.PaymentService;
 
-@Testcontainers(disabledWithoutDocker = true)
+@Testcontainers
 @SpringBootTest
 class PaymentServiceIntegrationTest {
 
@@ -60,6 +63,7 @@ class PaymentServiceIntegrationTest {
     void resetPaymentData() {
         jdbc.update("delete from payment.refunds");
         jdbc.update("delete from payment.payments");
+        jdbc.update("delete from payment.payment_intents");
     }
 
     @Test
@@ -136,6 +140,57 @@ class PaymentServiceIntegrationTest {
     }
 
     @Test
+    void cancellationTombstoneRejectsALatePaymentRequest() {
+        UUID reservationId = UUID.randomUUID();
+
+        PaymentCancellationResponse cancellation = paymentService.cancelPayment(
+                new PaymentCancellationRequest(reservationId));
+
+        assertThat(cancellation.reservationId()).isEqualTo(reservationId);
+        assertThat(cancellation.payment()).isNull();
+        assertThat(jdbc.queryForObject(
+                "select status from payment.payment_intents where reservation_id = ?",
+                String.class,
+                reservationId)).isEqualTo("CANCELLED");
+        assertThatThrownBy(() -> paymentService.createPayment(
+                new PaymentRequest(reservationId, 10_000, "EUR", "pm-late"),
+                null,
+                null))
+                .isInstanceOf(ConflictException.class)
+                .hasMessageContaining("cancelled");
+        assertThat(jdbc.queryForObject(
+                "select count(*) from payment.payments where reservation_id = ?",
+                Integer.class,
+                reservationId)).isZero();
+    }
+
+    @Test
+    void cancellationPreventsAProcessingPaymentFromCompletingLate() {
+        UUID paymentId = UUID.randomUUID();
+        UUID reservationId = UUID.randomUUID();
+        paymentRepository.insertPayment(
+                paymentId,
+                reservationId,
+                10_000,
+                "EUR",
+                "fingerprint",
+                PaymentStatus.PROCESSING,
+                null);
+
+        PaymentCancellationResponse cancellation = paymentService.cancelPayment(
+                new PaymentCancellationRequest(reservationId));
+        var lateCompletion = paymentRepository.completeProcessingPayment(
+                paymentId,
+                PaymentStatus.SUCCEEDED,
+                null);
+
+        assertThat(cancellation.payment()).isNotNull();
+        assertThat(cancellation.payment().status()).isEqualTo(PaymentStatus.FAILED);
+        assertThat(lateCompletion.status()).isEqualTo(PaymentStatus.FAILED);
+        assertThat(paymentService.getPayment(reservationId).status()).isEqualTo(PaymentStatus.FAILED);
+    }
+
+    @Test
     void excessiveSimulationDelayIsRejectedBeforePaymentIsCreated() {
         UUID reservationId = UUID.randomUUID();
 
@@ -150,5 +205,29 @@ class PaymentServiceIntegrationTest {
                 "select count(*) from payment.payments where reservation_id = ?",
                 Integer.class,
                 reservationId)).isZero();
+    }
+
+    @Test
+    void refundRejectsFailedAndProcessingPayments() {
+        UUID failedReservationId = UUID.randomUUID();
+        paymentService.createPayment(
+                new PaymentRequest(failedReservationId, 10_000, "EUR", "pm-failed"),
+                null,
+                "true");
+
+        UUID processingReservationId = UUID.randomUUID();
+        paymentRepository.insertPayment(
+                UUID.randomUUID(),
+                processingReservationId,
+                10_000,
+                "EUR",
+                "fingerprint",
+                PaymentStatus.PROCESSING,
+                null);
+
+        assertThatThrownBy(() -> paymentService.refund(new RefundRequest(failedReservationId)))
+                .isInstanceOf(ConflictException.class);
+        assertThatThrownBy(() -> paymentService.refund(new RefundRequest(processingReservationId)))
+                .isInstanceOf(ConflictException.class);
     }
 }

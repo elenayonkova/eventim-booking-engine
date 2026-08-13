@@ -1,9 +1,8 @@
 package com.eventim.booking.engine.booking.api;
 
-import java.util.stream.Collectors;
-
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.validation.FieldError;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
@@ -29,9 +28,7 @@ public class ApiExceptionHandler {
 
     @ExceptionHandler(MethodArgumentNotValidException.class)
     public ResponseEntity<ErrorResponse> validation(MethodArgumentNotValidException exception) {
-        String message = exception.getBindingResult().getFieldErrors().stream()
-                .map(error -> error.getField() + " " + error.getDefaultMessage())
-                .collect(Collectors.joining("; "));
+        String message = validationMessage(exception);
         return ResponseEntity.badRequest()
                 .body(ErrorResponse.of(400, "Bad Request", message));
     }
@@ -46,5 +43,18 @@ public class ApiExceptionHandler {
     public ResponseEntity<ErrorResponse> externalService(ExternalServiceException exception) {
         return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
                 .body(ErrorResponse.of(503, "Service Unavailable", exception.getMessage()));
+    }
+
+    private String validationMessage(MethodArgumentNotValidException exception) {
+        StringBuilder message = new StringBuilder();
+        for (FieldError error : exception.getBindingResult().getFieldErrors()) {
+            if (message.length() > 0) {
+                message.append("; ");
+            }
+            message.append(error.getField())
+                    .append(" ")
+                    .append(error.getDefaultMessage());
+        }
+        return message.toString();
     }
 }

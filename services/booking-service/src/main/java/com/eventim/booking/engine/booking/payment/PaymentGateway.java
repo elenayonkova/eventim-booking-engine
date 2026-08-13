@@ -9,5 +9,7 @@ public interface PaymentGateway {
 
     Optional<PaymentResult> find(UUID reservationId);
 
+    PaymentCancellationResult cancel(UUID reservationId);
+
     RefundResult refund(UUID reservationId);
 }

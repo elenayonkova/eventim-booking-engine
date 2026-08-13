@@ -17,15 +17,18 @@ import org.springframework.web.bind.annotation.ResponseStatus;
 import org.springframework.web.bind.annotation.RestController;
 
 import com.eventim.booking.engine.booking.service.BookingService;
+import com.eventim.booking.engine.booking.service.checkout.CheckoutService;
 
 @RestController
 @RequestMapping("/v1")
 public class BookingController {
 
     private final BookingService bookingService;
+    private final CheckoutService checkoutService;
 
-    public BookingController(BookingService bookingService) {
+    public BookingController(BookingService bookingService, CheckoutService checkoutService) {
         this.bookingService = bookingService;
+        this.checkoutService = checkoutService;
     }
 
     @GetMapping("/events/{eventId}/seats")
@@ -44,6 +47,6 @@ public class BookingController {
             @RequestHeader(name = "X-Simulate-Delay-Ms", required = false)
             @Min(0) @Max(MAX_DELAY_MS) Long simulatedDelayMs,
             @RequestHeader(name = "X-Simulate-Failure", required = false) String simulatedFailure) {
-        return bookingService.checkout(request, simulatedDelayMs, simulatedFailure);
+        return checkoutService.checkout(request, simulatedDelayMs, simulatedFailure);
     }
 }

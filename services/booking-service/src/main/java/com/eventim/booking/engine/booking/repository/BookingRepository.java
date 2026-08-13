@@ -1,7 +1,12 @@
 package com.eventim.booking.engine.booking.repository;
 
+import java.sql.ResultSet;
+import java.sql.SQLException;
 import java.time.Duration;
 import java.time.OffsetDateTime;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -22,38 +27,65 @@ import com.eventim.booking.engine.booking.service.NotFoundException;
 @Repository
 public class BookingRepository {
 
-    private static final RowMapper<SeatAvailabilityRow> SEAT_AVAILABILITY_ROW_MAPPER = (rs, rowNum) ->
-            new SeatAvailabilityRow(
-                    rs.getString("seat_label"),
-                    SeatStatus.valueOf(rs.getString("status")),
-                    rs.getObject("reservation_id", UUID.class),
-                    rs.getObject("hold_expires_at", OffsetDateTime.class));
+    private static final RowMapper<SeatAvailabilityRow> SEAT_AVAILABILITY_ROW_MAPPER =
+            new RowMapper<SeatAvailabilityRow>() {
+                @Override
+                public SeatAvailabilityRow mapRow(ResultSet rs, int rowNum) throws SQLException {
+                    return new SeatAvailabilityRow(
+                            rs.getString("seat_label"),
+                            SeatStatus.valueOf(rs.getString("status")),
+                            rs.getObject("reservation_id", UUID.class),
+                            rs.getObject("hold_expires_at", OffsetDateTime.class));
+                }
+            };
 
-    private static final RowMapper<SeatRow> SEAT_ROW_MAPPER = (rs, rowNum) -> new SeatRow(
-            rs.getObject("id", UUID.class),
-            rs.getString("seat_label"),
-            SeatStatus.valueOf(rs.getString("status")));
-
-    private static final RowMapper<ReservationRow> RESERVATION_ROW_MAPPER = (rs, rowNum) -> new ReservationRow(
-            rs.getObject("id", UUID.class),
-            rs.getString("event_id"),
-            ReservationStatus.valueOf(rs.getString("status")),
-            rs.getObject("expires_at", OffsetDateTime.class),
-            rs.getObject("payment_id", UUID.class),
-            rs.getObject("checkout_amount", Long.class),
-            rs.getString("checkout_currency"),
-            rs.getString("payment_method_fingerprint"),
-            rs.getObject("checkout_started_at", OffsetDateTime.class),
-            rs.getString("payment_failure_reason"));
-
-    private static final RowMapper<ReservationSeatRow> RESERVATION_SEAT_ROW_MAPPER = (rs, rowNum) ->
-            new ReservationSeatRow(
+    private static final RowMapper<SeatRow> SEAT_ROW_MAPPER = new RowMapper<SeatRow>() {
+        @Override
+        public SeatRow mapRow(ResultSet rs, int rowNum) throws SQLException {
+            return new SeatRow(
                     rs.getObject("id", UUID.class),
                     rs.getString("seat_label"),
-                    SeatStatus.valueOf(rs.getString("status")),
-                    rs.getObject("reservation_id", UUID.class),
-                    rs.getLong("price_amount"),
-                    rs.getString("currency"));
+                    SeatStatus.valueOf(rs.getString("status")));
+        }
+    };
+
+    private static final RowMapper<ReservationRow> RESERVATION_ROW_MAPPER = new RowMapper<ReservationRow>() {
+        @Override
+        public ReservationRow mapRow(ResultSet rs, int rowNum) throws SQLException {
+            return new ReservationRow(
+                    rs.getObject("id", UUID.class),
+                    rs.getString("event_id"),
+                    ReservationStatus.valueOf(rs.getString("status")),
+                    rs.getObject("expires_at", OffsetDateTime.class),
+                    rs.getObject("payment_id", UUID.class),
+                    rs.getObject("checkout_amount", Long.class),
+                    rs.getString("checkout_currency"),
+                    rs.getString("payment_method_fingerprint"),
+                    rs.getObject("checkout_started_at", OffsetDateTime.class),
+                    rs.getString("payment_failure_reason"));
+        }
+    };
+
+    private static final RowMapper<ReservationSeatRow> RESERVATION_SEAT_ROW_MAPPER =
+            new RowMapper<ReservationSeatRow>() {
+                @Override
+                public ReservationSeatRow mapRow(ResultSet rs, int rowNum) throws SQLException {
+                    return new ReservationSeatRow(
+                            rs.getObject("id", UUID.class),
+                            rs.getString("seat_label"),
+                            SeatStatus.valueOf(rs.getString("status")),
+                            rs.getObject("reservation_id", UUID.class),
+                            rs.getLong("price_amount"),
+                            rs.getString("currency"));
+                }
+            };
+
+    private static final RowMapper<UUID> UUID_ROW_MAPPER = new RowMapper<UUID>() {
+        @Override
+        public UUID mapRow(ResultSet rs, int rowNum) throws SQLException {
+            return rs.getObject("id", UUID.class);
+        }
+    };
 
     private final NamedParameterJdbcTemplate jdbc;
 
@@ -81,7 +113,7 @@ public class BookingRepository {
                   and reservation.status = 'HELD'
                 returning reservation.id
                 """,
-                (rs, rowNum) -> rs.getObject("id", UUID.class));
+                UUID_ROW_MAPPER);
 
         if (expiredReservationIds.isEmpty()) {
             return;
@@ -111,7 +143,7 @@ public class BookingRepository {
                 returning reservation.id
                 """,
                 Map.of("eventId", eventId),
-                (rs, rowNum) -> rs.getObject("id", UUID.class));
+                UUID_ROW_MAPPER);
 
         if (expiredReservationIds.isEmpty()) {
             return;
@@ -165,19 +197,26 @@ public class BookingRepository {
                 SEAT_ROW_MAPPER);
 
         if (lockedSeats.size() != sortedSeatLabels.size()) {
-            Set<String> foundLabels = lockedSeats.stream()
-                    .map(SeatRow::seatLabel)
-                    .collect(java.util.stream.Collectors.toSet());
-            List<String> missingLabels = sortedSeatLabels.stream()
-                    .filter(label -> !foundLabels.contains(label))
-                    .toList();
+            Set<String> foundLabels = new HashSet<>();
+            for (SeatRow lockedSeat : lockedSeats) {
+                foundLabels.add(lockedSeat.seatLabel());
+            }
+
+            List<String> missingLabels = new ArrayList<>();
+            for (String label : sortedSeatLabels) {
+                if (!foundLabels.contains(label)) {
+                    missingLabels.add(label);
+                }
+            }
             throw new NotFoundException("Seats not found for event " + eventId + ": " + missingLabels);
         }
 
-        List<String> unavailableLabels = lockedSeats.stream()
-                .filter(seat -> seat.status() != SeatStatus.AVAILABLE)
-                .map(SeatRow::seatLabel)
-                .toList();
+        List<String> unavailableLabels = new ArrayList<>();
+        for (SeatRow seat : lockedSeats) {
+            if (seat.status() != SeatStatus.AVAILABLE) {
+                unavailableLabels.add(seat.seatLabel());
+            }
+        }
 
         if (!unavailableLabels.isEmpty()) {
             throw new ConflictException("Seats are not available: " + unavailableLabels);
@@ -197,21 +236,21 @@ public class BookingRepository {
                         .addValue("status", ReservationStatus.HELD.name())
                         .addValue("expiresAt", expiresAt));
 
-        SqlParameterSource[] reservationSeatParams = lockedSeats.stream()
-                .map(seat -> new MapSqlParameterSource()
-                        .addValue("reservationId", reservationId)
-                        .addValue("seatId", seat.id()))
-                .toArray(SqlParameterSource[]::new);
+        SqlParameterSource[] reservationSeatParams = new SqlParameterSource[lockedSeats.size()];
+        List<UUID> seatIds = new ArrayList<>();
+        for (int i = 0; i < lockedSeats.size(); i++) {
+            SeatRow seat = lockedSeats.get(i);
+            reservationSeatParams[i] = new MapSqlParameterSource()
+                    .addValue("reservationId", reservationId)
+                    .addValue("seatId", seat.id());
+            seatIds.add(seat.id());
+        }
         jdbc.batchUpdate(
                 """
                 insert into reservation_seats (reservation_id, seat_id)
                 values (:reservationId, :seatId)
                 """,
                 reservationSeatParams);
-
-        List<UUID> seatIds = lockedSeats.stream()
-                .map(SeatRow::id)
-                .toList();
 
         jdbc.update(
                 """
@@ -343,7 +382,7 @@ public class BookingRepository {
                 order by checkout_started_at, id
                 limit 100
                 """,
-                (rs, rowNum) -> rs.getObject("id", UUID.class));
+                UUID_ROW_MAPPER);
     }
 
     public List<UUID> findRefundRequiredReservationIds() {
@@ -355,7 +394,7 @@ public class BookingRepository {
                 order by updated_at, id
                 limit 100
                 """,
-                (rs, rowNum) -> rs.getObject("id", UUID.class));
+                UUID_ROW_MAPPER);
     }
 
     public void bookSeats(UUID reservationId) {
@@ -369,6 +408,26 @@ public class BookingRepository {
                   and status = 'HELD'
                 """,
                 Map.of("reservationId", reservationId));
+    }
+
+    public void bookSeatsAndMarkBooked(UUID reservationId, UUID paymentId) {
+        bookSeats(reservationId);
+        markBooked(reservationId, paymentId);
+    }
+
+    public void markPaymentFailedAndReleaseSeats(UUID reservationId, UUID paymentId, String failureReason) {
+        releaseHeldSeats(reservationId);
+        markPaymentFailed(reservationId, paymentId, failureReason);
+    }
+
+    public void markRefundRequiredAndReleaseSeats(UUID reservationId, UUID paymentId, String reason) {
+        markRefundRequired(reservationId, paymentId, reason);
+        releaseHeldSeats(reservationId);
+    }
+
+    public void markRefundedAndReleaseSeats(UUID reservationId) {
+        releaseHeldSeats(reservationId);
+        markRefunded(reservationId);
     }
 
     public void markPaymentFailed(UUID reservationId, UUID paymentId, String failureReason) {
@@ -466,18 +525,24 @@ public class BookingRepository {
     }
 
     private List<String> normalizeSeatLabels(List<String> requestedSeatLabels) {
-        List<String> normalizedLabels = requestedSeatLabels.stream()
-                .map(String::trim)
-                .filter(label -> !label.isBlank())
-                .sorted()
-                .toList();
+        List<String> normalizedLabels = new ArrayList<>();
+        for (String requestedSeatLabel : requestedSeatLabels) {
+            String label = requestedSeatLabel.trim();
+            if (!label.isBlank()) {
+                normalizedLabels.add(label);
+            }
+        }
+        Collections.sort(normalizedLabels);
 
         if (normalizedLabels.size() != requestedSeatLabels.size()) {
             throw new ConflictException("Seat IDs must be non-blank");
         }
 
-        if (normalizedLabels.stream().distinct().count() != normalizedLabels.size()) {
-            throw new ConflictException("Seat IDs must be unique");
+        Set<String> seenLabels = new HashSet<>();
+        for (String label : normalizedLabels) {
+            if (!seenLabels.add(label)) {
+                throw new ConflictException("Seat IDs must be unique");
+            }
         }
 
         return normalizedLabels;

@@ -3,13 +3,13 @@ package com.eventim.booking.engine.booking.payment.http;
 import java.util.Optional;
 import java.util.UUID;
 
-import org.springframework.http.HttpHeaders;
 import org.springframework.web.client.HttpClientErrorException;
 import org.springframework.web.client.RestClient;
 import org.springframework.web.client.RestClientException;
 
 import com.eventim.booking.engine.booking.payment.ChargePayment;
 import com.eventim.booking.engine.booking.payment.PaymentGateway;
+import com.eventim.booking.engine.booking.payment.PaymentCancellationResult;
 import com.eventim.booking.engine.booking.payment.PaymentResult;
 import com.eventim.booking.engine.booking.payment.PaymentSimulation;
 import com.eventim.booking.engine.booking.payment.PaymentStatus;
@@ -29,9 +29,11 @@ public class HttpPaymentGateway implements PaymentGateway {
     @Override
     public PaymentResult charge(ChargePayment command) {
         try {
-            PaymentResponse response = restClient.post()
-                    .uri("/v1/payments")
-                    .headers(headers -> addSimulationHeaders(headers, command.simulation()))
+            RestClient.RequestBodySpec request = restClient.post()
+                    .uri("/v1/payments");
+            addSimulationHeaders(request, command.simulation());
+
+            PaymentResponse response = request
                     .body(new PaymentRequest(
                             command.reservationId(),
                             command.amount(),
@@ -57,11 +59,34 @@ public class HttpPaymentGateway implements PaymentGateway {
                     .uri("/v1/payments/by-reservation/{reservationId}", reservationId)
                     .retrieve()
                     .body(PaymentResponse.class);
-            return Optional.ofNullable(response).map(PaymentResponse::toResult);
+            if (response == null) {
+                return Optional.empty();
+            }
+            return Optional.of(response.toResult());
         } catch (HttpClientErrorException.NotFound exception) {
             return Optional.empty();
         } catch (RestClientException exception) {
             throw new ExternalServiceException("Payment status could not be retrieved", exception);
+        }
+    }
+
+    @Override
+    public PaymentCancellationResult cancel(UUID reservationId) {
+        try {
+            PaymentCancellationResponse response = restClient.post()
+                    .uri("/v1/payments/cancellations")
+                    .body(new PaymentCancellationRequest(reservationId))
+                    .retrieve()
+                    .body(PaymentCancellationResponse.class);
+            if (response == null) {
+                throw new ExternalServiceException(
+                        "Payment service returned an empty cancellation response");
+            }
+            return response.toResult();
+        } catch (RestClientException exception) {
+            throw new ExternalServiceException(
+                    "Payment cancellation could not be confirmed; reservation remains pending",
+                    exception);
         }
     }
 
@@ -82,12 +107,12 @@ public class HttpPaymentGateway implements PaymentGateway {
         }
     }
 
-    private void addSimulationHeaders(HttpHeaders headers, PaymentSimulation simulation) {
+    private void addSimulationHeaders(RestClient.RequestBodySpec request, PaymentSimulation simulation) {
         if (simulation.delayMs() != null) {
-            headers.set("X-Simulate-Delay-Ms", simulation.delayMs().toString());
+            request.header("X-Simulate-Delay-Ms", simulation.delayMs().toString());
         }
         if (simulation.failure() != null && !simulation.failure().isBlank()) {
-            headers.set("X-Simulate-Failure", simulation.failure());
+            request.header("X-Simulate-Failure", simulation.failure());
         }
     }
 
@@ -97,6 +122,20 @@ public class HttpPaymentGateway implements PaymentGateway {
             String currency,
             String paymentMethodToken
     ) {
+    }
+
+    private record PaymentCancellationRequest(UUID reservationId) {
+    }
+
+    private record PaymentCancellationResponse(
+            UUID reservationId,
+            PaymentResponse payment
+    ) {
+        PaymentCancellationResult toResult() {
+            return new PaymentCancellationResult(
+                    reservationId,
+                    payment == null ? null : payment.toResult());
+        }
     }
 
     private record PaymentResponse(

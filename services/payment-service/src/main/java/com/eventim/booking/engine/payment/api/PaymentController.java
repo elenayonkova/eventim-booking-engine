@@ -36,6 +36,13 @@ public class PaymentController {
         return paymentService.createPayment(request, delayMs, simulateFailure);
     }
 
+    @PostMapping("/payments/cancellations")
+    public PaymentCancellationResponse cancelPayment(
+            @Valid @RequestBody PaymentCancellationRequest request
+    ) {
+        return paymentService.cancelPayment(request);
+    }
+
     @PostMapping("/refunds")
     public RefundResponse refund(@Valid @RequestBody RefundRequest request) {
         return paymentService.refund(request);

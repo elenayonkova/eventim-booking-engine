@@ -1,5 +1,7 @@
 package com.eventim.booking.engine.payment.repository;
 
+import java.sql.ResultSet;
+import java.sql.SQLException;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -12,25 +14,36 @@ import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate;
 import org.springframework.stereotype.Repository;
 
 import com.eventim.booking.engine.payment.domain.PaymentStatus;
+import com.eventim.booking.engine.payment.domain.PaymentIntentStatus;
 import com.eventim.booking.engine.payment.domain.RefundStatus;
 
 @Repository
 public class PaymentRepository {
 
-    private static final RowMapper<PaymentRecord> PAYMENT_ROW_MAPPER = (rs, rowNum) -> new PaymentRecord(
-            rs.getObject("id", UUID.class),
-            rs.getObject("reservation_id", UUID.class),
-            rs.getLong("amount"),
-            rs.getString("currency"),
-            rs.getString("payment_method_fingerprint"),
-            PaymentStatus.valueOf(rs.getString("status")),
-            rs.getString("failure_reason"));
+    private static final RowMapper<PaymentRecord> PAYMENT_ROW_MAPPER = new RowMapper<PaymentRecord>() {
+        @Override
+        public PaymentRecord mapRow(ResultSet rs, int rowNum) throws SQLException {
+            return new PaymentRecord(
+                    rs.getObject("id", UUID.class),
+                    rs.getObject("reservation_id", UUID.class),
+                    rs.getLong("amount"),
+                    rs.getString("currency"),
+                    rs.getString("payment_method_fingerprint"),
+                    PaymentStatus.valueOf(rs.getString("status")),
+                    rs.getString("failure_reason"));
+        }
+    };
 
-    private static final RowMapper<RefundRecord> REFUND_ROW_MAPPER = (rs, rowNum) -> new RefundRecord(
-            rs.getObject("id", UUID.class),
-            rs.getObject("reservation_id", UUID.class),
-            rs.getObject("payment_id", UUID.class),
-            RefundStatus.valueOf(rs.getString("status")));
+    private static final RowMapper<RefundRecord> REFUND_ROW_MAPPER = new RowMapper<RefundRecord>() {
+        @Override
+        public RefundRecord mapRow(ResultSet rs, int rowNum) throws SQLException {
+            return new RefundRecord(
+                    rs.getObject("id", UUID.class),
+                    rs.getObject("reservation_id", UUID.class),
+                    rs.getObject("payment_id", UUID.class),
+                    RefundStatus.valueOf(rs.getString("status")));
+        }
+    };
 
     private final NamedParameterJdbcTemplate jdbc;
 
@@ -51,6 +64,46 @@ public class PaymentRepository {
         } catch (EmptyResultDataAccessException exception) {
             return Optional.empty();
         }
+    }
+
+    public PaymentIntentStatus lockOrCreatePaymentIntent(
+            UUID reservationId,
+            PaymentIntentStatus initialStatus
+    ) {
+        jdbc.update(
+                """
+                insert into payment_intents (reservation_id, status)
+                values (:reservationId, :status)
+                on conflict (reservation_id) do nothing
+                """,
+                new MapSqlParameterSource()
+                        .addValue("reservationId", reservationId)
+                        .addValue("status", initialStatus.name()));
+        return lockPaymentIntent(reservationId);
+    }
+
+    public PaymentIntentStatus lockPaymentIntent(UUID reservationId) {
+        String status = jdbc.queryForObject(
+                """
+                select status
+                from payment_intents
+                where reservation_id = :reservationId
+                for update
+                """,
+                Map.of("reservationId", reservationId),
+                String.class);
+        return PaymentIntentStatus.valueOf(status);
+    }
+
+    public void markPaymentIntentCancelled(UUID reservationId) {
+        jdbc.update(
+                """
+                update payment_intents
+                set status = 'CANCELLED',
+                    updated_at = now()
+                where reservation_id = :reservationId
+                """,
+                Map.of("reservationId", reservationId));
     }
 
     public Optional<PaymentRecord> findPaymentByReservationIdForUpdate(UUID reservationId) {
@@ -119,7 +172,7 @@ public class PaymentRepository {
                 paymentParams(paymentId, reservationId, amount, currency, paymentMethodFingerprint, status, failureReason),
                 PAYMENT_ROW_MAPPER);
 
-        return inserted.stream().findFirst();
+        return firstPayment(inserted);
     }
 
     public PaymentRecord insertPayment(
@@ -131,15 +184,25 @@ public class PaymentRepository {
             PaymentStatus status,
             String failureReason
     ) {
-        return insertPaymentIfAbsent(
+        PaymentIntentStatus intent = lockOrCreatePaymentIntent(
+                reservationId,
+                PaymentIntentStatus.ACTIVE);
+        if (intent == PaymentIntentStatus.CANCELLED) {
+            throw new IllegalStateException("Payment intent is cancelled for reservation " + reservationId);
+        }
+        Optional<PaymentRecord> inserted = insertPaymentIfAbsent(
                 paymentId,
                 reservationId,
                 amount,
                 currency,
                 paymentMethodFingerprint,
                 status,
-                failureReason)
-                .orElseThrow(() -> new IllegalStateException("Payment already exists for reservation " + reservationId));
+                failureReason);
+        if (inserted.isEmpty()) {
+            throw new IllegalStateException("Payment already exists for reservation " + reservationId);
+        }
+
+        return inserted.get();
     }
 
     public Optional<RefundRecord> insertRefundIfAbsent(UUID refundId, UUID reservationId, UUID paymentId, RefundStatus status) {
@@ -157,7 +220,7 @@ public class PaymentRepository {
                         .addValue("status", status.name()),
                 REFUND_ROW_MAPPER);
 
-        return inserted.stream().findFirst();
+        return firstRefund(inserted);
     }
 
     public void markPaymentRefunded(UUID paymentId) {
@@ -246,5 +309,21 @@ public class PaymentRepository {
                 .addValue("paymentMethodFingerprint", paymentMethodFingerprint)
                 .addValue("status", status.name())
                 .addValue("failureReason", failureReason);
+    }
+
+    private Optional<PaymentRecord> firstPayment(List<PaymentRecord> payments) {
+        if (payments.isEmpty()) {
+            return Optional.empty();
+        }
+
+        return Optional.of(payments.get(0));
+    }
+
+    private Optional<RefundRecord> firstRefund(List<RefundRecord> refunds) {
+        if (refunds.isEmpty()) {
+            return Optional.empty();
+        }
+
+        return Optional.of(refunds.get(0));
     }
 }

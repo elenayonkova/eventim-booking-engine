@@ -1,4 +1,4 @@
-package com.eventim.booking.engine.booking.service;
+package com.eventim.booking.engine.booking.service.checkout;
 
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
@@ -6,14 +6,14 @@ import org.springframework.stereotype.Component;
 @Component
 public class PaymentReconciliationJob {
 
-    private final BookingService bookingService;
+    private final CheckoutService checkoutService;
 
-    public PaymentReconciliationJob(BookingService bookingService) {
-        this.bookingService = bookingService;
+    public PaymentReconciliationJob(CheckoutService checkoutService) {
+        this.checkoutService = checkoutService;
     }
 
     @Scheduled(fixedDelayString = "${booking.payment-reconciliation-sweep-ms:30000}")
     public void reconcilePayments() {
-        bookingService.reconcilePendingPayments();
+        checkoutService.reconcilePendingPayments();
     }
 }
