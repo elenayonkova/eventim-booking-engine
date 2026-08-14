@@ -14,6 +14,11 @@ import com.eventim.booking.engine.booking.domain.ReservationStatus;
 import com.eventim.booking.engine.booking.repository.BookingRepository;
 import com.eventim.booking.engine.booking.repository.SeatAvailabilityRow;
 
+/**
+ * Handles seat-availability queries and reservation creation. Each operation
+ * is transactional so expired holds and seat ownership changes remain atomic;
+ * checkout orchestration is kept in the checkout package.
+ */
 @Service
 public class BookingService {
 

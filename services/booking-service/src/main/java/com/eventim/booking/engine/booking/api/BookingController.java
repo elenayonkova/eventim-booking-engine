@@ -19,6 +19,11 @@ import org.springframework.web.bind.annotation.RestController;
 import com.eventim.booking.engine.booking.service.BookingService;
 import com.eventim.booking.engine.booking.service.checkout.CheckoutService;
 
+/**
+ * Exposes the booking HTTP API for seat availability, reservation holds, and
+ * checkout. Business decisions are delegated to {@link BookingService} and
+ * {@link CheckoutService}.
+ */
 @RestController
 @RequestMapping("/v1")
 public class BookingController {

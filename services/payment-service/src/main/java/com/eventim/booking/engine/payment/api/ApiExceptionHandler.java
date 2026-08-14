@@ -10,6 +10,10 @@ import org.springframework.web.bind.annotation.RestControllerAdvice;
 import com.eventim.booking.engine.payment.service.ConflictException;
 import com.eventim.booking.engine.payment.service.NotFoundException;
 
+/**
+ * Translates payment and validation failures into the stable
+ * {@link ErrorResponse} representation returned by the HTTP API.
+ */
 @RestControllerAdvice
 public class ApiExceptionHandler {
 

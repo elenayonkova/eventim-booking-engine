@@ -6,6 +6,10 @@ import org.springframework.transaction.annotation.Transactional;
 
 import com.eventim.booking.engine.booking.repository.BookingRepository;
 
+/**
+ * Periodically expires timed-out reservation holds and releases their seats in
+ * a single transaction.
+ */
 @Component
 public class ReservationExpiryJob {
 

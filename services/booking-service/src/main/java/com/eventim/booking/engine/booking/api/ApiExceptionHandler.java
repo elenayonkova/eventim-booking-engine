@@ -11,6 +11,10 @@ import com.eventim.booking.engine.booking.service.ConflictException;
 import com.eventim.booking.engine.booking.service.ExternalServiceException;
 import com.eventim.booking.engine.booking.service.NotFoundException;
 
+/**
+ * Translates booking, validation, and downstream-service failures into the
+ * stable {@link ErrorResponse} representation returned by the HTTP API.
+ */
 @RestControllerAdvice
 public class ApiExceptionHandler {
 

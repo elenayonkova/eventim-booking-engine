@@ -16,6 +16,11 @@ import org.springframework.web.bind.annotation.RestController;
 
 import com.eventim.booking.engine.payment.service.PaymentService;
 
+/**
+ * Exposes payment creation, lookup, cancellation, and refund endpoints. Request
+ * validation is handled at the HTTP boundary and processing is delegated to
+ * {@link PaymentService}.
+ */
 @RestController
 @RequestMapping("/v1")
 public class PaymentController {
@@ -38,14 +43,22 @@ public class PaymentController {
 
     @PostMapping("/payments/cancellations")
     public PaymentCancellationResponse cancelPayment(
-            @Valid @RequestBody PaymentCancellationRequest request
+            @Valid @RequestBody PaymentCancellationRequest request,
+            @RequestHeader(name = "X-Simulate-Delay-Ms", required = false)
+            @Min(0) @Max(MAX_SIMULATED_DELAY_MS) Long delayMs,
+            @RequestHeader(name = "X-Simulate-Failure", required = false) String simulateFailure
     ) {
-        return paymentService.cancelPayment(request);
+        return paymentService.cancelPayment(request, delayMs, simulateFailure);
     }
 
     @PostMapping("/refunds")
-    public RefundResponse refund(@Valid @RequestBody RefundRequest request) {
-        return paymentService.refund(request);
+    public RefundResponse refund(
+            @Valid @RequestBody RefundRequest request,
+            @RequestHeader(name = "X-Simulate-Delay-Ms", required = false)
+            @Min(0) @Max(MAX_SIMULATED_DELAY_MS) Long delayMs,
+            @RequestHeader(name = "X-Simulate-Failure", required = false) String simulateFailure
+    ) {
+        return paymentService.refund(request, delayMs, simulateFailure);
     }
 
     @GetMapping("/payments/by-reservation/{reservationId}")

@@ -23,7 +23,7 @@ reservation twice.
 - Docker Compose provides a quick local setup.
 - Carvel and kind provide a local Kubernetes setup with two copies of each
   service, health checks, resource limits, and persistent PostgreSQL storage.
-- Sixteen integration tests cover concurrent reservations and payment edge cases.
+- Integration tests cover concurrent reservations and payment edge cases.
 
 ## Architecture
 
@@ -53,39 +53,133 @@ and also reduces the risk of database deadlocks.
 Expired reservations are processed in small batches. `FOR UPDATE SKIP LOCKED`
 allows more than one Booking Service instance to run this work safely.
 
+### Reservation lifecycle
+
+The reservation status records the durable checkout decision. Seat state is
+updated in the same transaction as each reservation transition.
+
+```mermaid
+stateDiagram-v2
+  [*] --> HELD: reservation created
+  HELD --> EXPIRED: hold expires
+  HELD --> PAYMENT_PENDING: checkout begins
+  PAYMENT_PENDING --> PAYMENT_PENDING: payment is still processing
+  PAYMENT_PENDING --> BOOKED: matching payment succeeds
+  PAYMENT_PENDING --> PAYMENT_FAILED: payment fails or cancellation is confirmed
+  PAYMENT_PENDING --> REFUND_REQUIRED: successful payment cannot be applied safely
+  PAYMENT_PENDING --> REFUNDED: payment was already refunded
+  REFUND_REQUIRED --> REFUND_REQUIRED: refund is unresolved
+  REFUND_REQUIRED --> REFUNDED: refund succeeds
+  EXPIRED --> [*]
+  BOOKED --> [*]
+  PAYMENT_FAILED --> [*]
+  REFUNDED --> [*]
+```
+
+`BOOKED` moves the held seats to `BOOKED`. Expiry or payment failure releases
+them to `AVAILABLE`. A successful payment that cannot be applied safely enters
+`REFUND_REQUIRED` and releases the seats before the refund call; `REFUNDED`
+records that the financial recovery completed.
+
 ### How checkout stays correct
 
 The Booking Service does not keep a database transaction open while it waits for
-the Payment Service. The flow is:
+the Payment Service, and the Payment Service does not keep one open while it
+waits for the provider. A first checkout follows these transaction boundaries:
 
-1. Lock the reservation and its seats.
-2. Calculate the price from the saved seat prices.
-3. Save the reservation as `PAYMENT_PENDING` and finish the transaction.
-4. Ask the Payment Service to charge the reservation.
-5. Start a new transaction and save the result as `BOOKED` or
-   `PAYMENT_FAILED`.
+```mermaid
+sequenceDiagram
+  actor Client
+  participant Booking as Booking Service
+  participant Payment as Payment Service
+  participant Provider as Payment Provider
+
+  Client->>Booking: POST /v1/checkout
+  Booking->>Booking: DB tx: save PAYMENT_PENDING
+  Booking->>Payment: Create or return payment
+  Payment->>Payment: DB tx: save PROCESSING
+  Note over Payment,Provider: The provider call runs after the commit
+  Payment->>Provider: Charge
+  Provider-->>Payment: Succeeded or failed
+  Payment->>Payment: DB tx: save final status
+  Payment-->>Booking: Payment result
+
+  alt Matching payment succeeded
+    Booking->>Booking: DB tx: book seats and mark BOOKED
+    Booking-->>Client: BOOKED
+  else Payment failed
+    Booking->>Booking: DB tx: mark PAYMENT_FAILED and release seats
+    Booking-->>Client: PAYMENT_FAILED
+  else Successful payment cannot be applied safely
+    Booking->>Booking: DB tx: mark REFUND_REQUIRED and release seats
+    Note over Booking,Payment: Continue with the refund flow below
+  end
+```
+
+If a successful charge cannot be applied safely, refund recovery follows the
+same durable start, provider call, and completion pattern:
+
+```mermaid
+sequenceDiagram
+  actor Client
+  participant Booking as Booking Service
+  participant Payment as Payment Service
+  participant Provider as Payment Provider
+
+  Booking->>Payment: Refund reservation
+  Payment->>Payment: DB tx: save PROCESSING refund
+  Note over Payment,Provider: The provider call runs after the commit
+  Payment->>Provider: Refund
+  Provider-->>Payment: Succeeded or failed
+  Payment->>Payment: DB tx: save final refund status
+  Payment-->>Booking: Refund result
+
+  alt Refund succeeded
+    Booking->>Booking: DB tx: mark REFUNDED
+    Booking-->>Client: REFUNDED
+  else Refund failed or is unresolved
+    Booking->>Booking: Keep REFUND_REQUIRED
+    Booking-->>Client: 503, retry safely
+  end
+```
 
 The reservation ID is used as the payment idempotency key. If the same checkout
 is sent again, the Payment Service returns the existing payment. It does not
 create another charge.
 
 If the payment response is lost or takes too long, the Booking Service keeps the
-reservation in `PAYMENT_PENDING`. A background job checks the Payment Service
-for the final result. Before applying it, the Booking Service verifies the
-amount, currency, and payment-token fingerprint against the stored checkout.
-A successful mismatched payment is refunded instead of booking seats. The
-client can also retry the same checkout safely.
+reservation in `PAYMENT_PENDING`. The client can retry safely, and a background
+job follows this recovery flow:
 
-If no payment is found after the reconciliation timeout, the Booking Service
-asks the Payment Service to cancel the reservation-scoped payment intent. The
-Payment Service serializes cancellation with payment creation and completion.
-Only a durable cancellation allows the seats to be released; if payment won
-the race, its final result is returned and applied instead.
+```mermaid
+flowchart TD
+  Pending["Reservation PAYMENT_PENDING"] --> Lookup{"Payment lookup result?"}
+  Lookup -->|PROCESSING| Keep["Keep PAYMENT_PENDING for the next sweep"]
+  Lookup -->|Final result| Apply["Verify and apply result"]
+  Lookup -->|404| Timeout{"Reconciliation timeout elapsed?"}
+  Timeout -->|No| Keep
+  Timeout -->|Yes| Cancel["Cancel reservation-scoped intent"]
 
-If payment succeeds but the seats cannot be booked, the reservation moves to
-`REFUND_REQUIRED`. The system then sends an idempotent refund request.
+  Cancel --> Exists{"Payment exists when cancellation locks the intent?"}
+  Exists -->|No| Tombstone["Save durable CANCELLED tombstone"]
+  Tombstone --> Failed["Mark PAYMENT_FAILED and release seats"]
 
-The Payment Service saves a `PROCESSING` payment before the simulated delay.
+  Exists -->|Started during race| CancelPending["Save CANCELLATION_PENDING"]
+  CancelPending --> Provider["Provider cancels or resolves the charge"]
+  Provider -->|Cancellation wins| Cancelled["Payment FAILED and intent CANCELLED"]
+  Cancelled --> Failed
+  Provider -->|Charge wins| Succeeded["Payment SUCCEEDED and intent ACTIVE"]
+  Succeeded --> Apply
+```
+
+Before applying any recovered result, the Booking Service verifies the amount,
+currency, and payment-token fingerprint against the stored checkout. A
+successful mismatched payment is refunded instead of booking seats. The durable
+cancellation handshake prevents a late payment from succeeding after its seats
+have been released.
+
+The Payment Service saves a `PROCESSING` payment or refund before the simulated
+provider delay, then applies the final result in a separate transaction.
 Unique constraints on `reservation_id` and `INSERT ... ON CONFLICT` collapse
 concurrent payment or refund retries into one durable record. A retry with a
 different amount, currency, or payment token is rejected.
@@ -130,11 +224,14 @@ Payment Service (`:8081`, internal in Kubernetes):
 | `POST` | `/v1/refunds` | Create a refund or return the existing refund |
 | `GET` | `/actuator/health` | Check service health |
 
-Checkout accepts the payment simulation headers while
-`PAYMENT_SIMULATION_ENABLED` is true:
+Checkout forwards the following headers only when creating a payment. Direct
+calls to the Payment Service accept the same headers on payment creation,
+cancellation, and refund creation while `PAYMENT_SIMULATION_ENABLED` is true:
 
-- `X-Simulate-Delay-Ms`: delay the payment response by up to 60,000 ms.
-- `X-Simulate-Failure: true`: return a failed payment.
+- `X-Simulate-Delay-Ms`: delay the simulated provider response by up to 60,000 ms.
+- `X-Simulate-Failure: true`: complete a payment or refund as failed. For a
+  cancellation, it simulates the charge winning the race, so the payment
+  completes as `SUCCEEDED`.
 
 ## Run with Docker Compose
 
@@ -245,7 +342,3 @@ The following points were confirmed after the assignment questions were sent:
 The implementation therefore focuses on concurrency, payment idempotency and
 recovery, automated tests, and a reproducible local deployment.
 
-## Possible production enhancements
-
-The current implementation matches the confirmed scope. Any further work should
-be based on real product requirements, operating needs, and measured load.

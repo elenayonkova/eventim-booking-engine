@@ -18,6 +18,11 @@ import com.eventim.booking.engine.booking.payment.RefundStatus;
 import com.eventim.booking.engine.booking.service.ConflictException;
 import com.eventim.booking.engine.booking.service.ExternalServiceException;
 
+/**
+ * HTTP adapter for {@link PaymentGateway}. It translates payment-service
+ * payloads into booking payment results and maps transport failures to service
+ * exceptions understood by the checkout workflow.
+ */
 public class HttpPaymentGateway implements PaymentGateway {
 
     private final RestClient restClient;

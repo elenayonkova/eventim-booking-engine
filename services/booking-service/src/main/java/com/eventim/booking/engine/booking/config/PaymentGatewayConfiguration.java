@@ -8,6 +8,10 @@ import org.springframework.web.client.RestClient;
 import com.eventim.booking.engine.booking.payment.PaymentGateway;
 import com.eventim.booking.engine.booking.payment.http.HttpPaymentGateway;
 
+/**
+ * Builds the HTTP payment gateway with the configured payment-service endpoint
+ * and connection timeouts.
+ */
 @Configuration
 public class PaymentGatewayConfiguration {
 

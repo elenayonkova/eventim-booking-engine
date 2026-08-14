@@ -7,6 +7,11 @@ import com.eventim.booking.engine.booking.domain.ReservationStatus;
 import com.eventim.booking.engine.booking.repository.ReservationRow;
 import com.eventim.booking.engine.booking.service.ConflictException;
 
+/**
+ * Immutable handoff between transactional {@link ReservationCheckout} state
+ * changes and the non-transactional {@link CheckoutService} orchestration. Its
+ * action describes the next external or response-producing step.
+ */
 record CheckoutStep(
         Action action,
         UUID reservationId,

@@ -24,6 +24,11 @@ import com.eventim.booking.engine.booking.domain.SeatStatus;
 import com.eventim.booking.engine.booking.service.ConflictException;
 import com.eventim.booking.engine.booking.service.NotFoundException;
 
+/**
+ * JDBC persistence gateway for events, seats, and reservations. It provides
+ * lock-aware queries and atomic state updates that are composed within service
+ * transaction boundaries.
+ */
 @Repository
 public class BookingRepository {
 

@@ -17,6 +17,11 @@ import com.eventim.booking.engine.payment.domain.PaymentStatus;
 import com.eventim.booking.engine.payment.domain.PaymentIntentStatus;
 import com.eventim.booking.engine.payment.domain.RefundStatus;
 
+/**
+ * JDBC persistence gateway for payment intents, payments, and refunds. It
+ * exposes lock-aware and idempotent updates intended to run inside service
+ * transaction boundaries.
+ */
 @Repository
 public class PaymentRepository {
 
@@ -95,15 +100,20 @@ public class PaymentRepository {
         return PaymentIntentStatus.valueOf(status);
     }
 
-    public void markPaymentIntentCancelled(UUID reservationId) {
+    public void updatePaymentIntentStatus(
+            UUID reservationId,
+            PaymentIntentStatus status
+    ) {
         jdbc.update(
                 """
                 update payment_intents
-                set status = 'CANCELLED',
+                set status = :status,
                     updated_at = now()
                 where reservation_id = :reservationId
                 """,
-                Map.of("reservationId", reservationId));
+                new MapSqlParameterSource()
+                        .addValue("reservationId", reservationId)
+                        .addValue("status", status.name()));
     }
 
     public Optional<PaymentRecord> findPaymentByReservationIdForUpdate(UUID reservationId) {
@@ -123,13 +133,24 @@ public class PaymentRepository {
     }
 
     public Optional<RefundRecord> findRefundByReservationId(UUID reservationId) {
+        return findRefundByReservationId(reservationId, false);
+    }
+
+    public Optional<RefundRecord> findRefundByReservationIdForUpdate(UUID reservationId) {
+        return findRefundByReservationId(reservationId, true);
+    }
+
+    private Optional<RefundRecord> findRefundByReservationId(
+            UUID reservationId,
+            boolean forUpdate
+    ) {
         try {
+            String lockClause = forUpdate ? " for update" : "";
             return Optional.of(jdbc.queryForObject(
-                    """
-                    select id, reservation_id, payment_id, status
-                    from refunds
-                    where reservation_id = :reservationId
-                    """,
+                    "select id, reservation_id, payment_id, status "
+                            + "from refunds "
+                            + "where reservation_id = :reservationId"
+                            + lockClause,
                     Map.of("reservationId", reservationId),
                     REFUND_ROW_MAPPER));
         } catch (EmptyResultDataAccessException exception) {
@@ -187,8 +208,9 @@ public class PaymentRepository {
         PaymentIntentStatus intent = lockOrCreatePaymentIntent(
                 reservationId,
                 PaymentIntentStatus.ACTIVE);
-        if (intent == PaymentIntentStatus.CANCELLED) {
-            throw new IllegalStateException("Payment intent is cancelled for reservation " + reservationId);
+        if (intent != PaymentIntentStatus.ACTIVE) {
+            throw new IllegalStateException(
+                    "Payment intent is not active for reservation " + reservationId);
         }
         Optional<PaymentRecord> inserted = insertPaymentIfAbsent(
                 paymentId,
@@ -225,6 +247,21 @@ public class PaymentRepository {
 
     public void markPaymentRefunded(UUID paymentId) {
         updatePaymentStatus(paymentId, PaymentStatus.REFUNDED, null);
+    }
+
+    public RefundRecord completeProcessingRefund(UUID refundId, RefundStatus status) {
+        jdbc.update(
+                """
+                update refunds
+                set status = :status,
+                    updated_at = now()
+                where id = :refundId
+                  and status = 'PROCESSING'
+                """,
+                new MapSqlParameterSource()
+                        .addValue("refundId", refundId)
+                        .addValue("status", status.name()));
+        return findRefundById(refundId);
     }
 
     public PaymentRecord updatePaymentStatus(
@@ -281,6 +318,35 @@ public class PaymentRepository {
                 Map.of("timeoutSeconds", timeout.toSeconds()));
     }
 
+    public int finalizeFailedCancellationIntents() {
+        return jdbc.update(
+                """
+                update payment_intents intent
+                set status = 'CANCELLED',
+                    updated_at = now()
+                where intent.status = 'CANCELLATION_PENDING'
+                  and exists (
+                      select 1
+                      from payments payment
+                      where payment.reservation_id = intent.reservation_id
+                        and payment.status = 'FAILED'
+                  )
+                """,
+                Map.of());
+    }
+
+    public int failStaleProcessingRefunds(java.time.Duration timeout) {
+        return jdbc.update(
+                """
+                update refunds
+                set status = 'FAILED',
+                    updated_at = now()
+                where status = 'PROCESSING'
+                  and updated_at <= now() - (:timeoutSeconds * interval '1 second')
+                """,
+                Map.of("timeoutSeconds", timeout.toSeconds()));
+    }
+
     private PaymentRecord findPaymentById(UUID paymentId) {
         return jdbc.queryForObject(
                 """
@@ -290,6 +356,17 @@ public class PaymentRepository {
                 """,
                 Map.of("paymentId", paymentId),
                 PAYMENT_ROW_MAPPER);
+    }
+
+    private RefundRecord findRefundById(UUID refundId) {
+        return jdbc.queryForObject(
+                """
+                select id, reservation_id, payment_id, status
+                from refunds
+                where id = :refundId
+                """,
+                Map.of("refundId", refundId),
+                REFUND_ROW_MAPPER);
     }
 
     private MapSqlParameterSource paymentParams(
