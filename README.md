@@ -35,18 +35,17 @@ that all are `AVAILABLE`, and stores the seat-price total plus the event
 currency. Checkout then uses that immutable reservation snapshot while locking
 seat rows only for ownership and transition safety.
 
-```mermaid
-stateDiagram-v2
-  [*] --> HELD
-  HELD --> EXPIRED
-  HELD --> PAYMENT_PENDING
-  PAYMENT_PENDING --> PAYMENT_PENDING: provider still processing
-  PAYMENT_PENDING --> BOOKED: matching payment succeeds
-  PAYMENT_PENDING --> PAYMENT_FAILED: payment fails or is cancelled
-  PAYMENT_PENDING --> REFUND_REQUIRED: successful payment cannot be applied
-  REFUND_REQUIRED --> REFUNDED: refund succeeds
-  PAYMENT_PENDING --> REFUNDED: payment was already refunded
-```
+| From | To | Trigger |
+| --- | --- | --- |
+| New | `HELD` | All requested seats are locked and available |
+| `HELD` | `EXPIRED` | Hold deadline passes |
+| `HELD` | `PAYMENT_PENDING` | Checkout starts |
+| `PAYMENT_PENDING` | `PAYMENT_PENDING` | Provider is still processing |
+| `PAYMENT_PENDING` | `BOOKED` | Matching payment succeeds |
+| `PAYMENT_PENDING` | `PAYMENT_FAILED` | Payment fails or cancellation succeeds |
+| `PAYMENT_PENDING` | `REFUND_REQUIRED` | Successful payment cannot be applied safely |
+| `PAYMENT_PENDING` | `REFUNDED` | Payment was already refunded |
+| `REFUND_REQUIRED` | `REFUNDED` | Refund succeeds |
 
 Reservation status alone selects the next checkout operation:
 
@@ -62,17 +61,19 @@ charge. Only `REFUND_REQUIRED` triggers a second external operation.
 
 ### Payments and refunds
 
-```mermaid
-stateDiagram-v2
-  [*] --> PROCESSING: payment starts
-  [*] --> CANCELLED: cancellation tombstone
-  PROCESSING --> SUCCEEDED
-  PROCESSING --> FAILED
-  PROCESSING --> CANCELLATION_PENDING
-  CANCELLATION_PENDING --> CANCELLED
-  CANCELLATION_PENDING --> SUCCEEDED
-  SUCCEEDED --> REFUNDED
-```
+| From | To | Trigger |
+| --- | --- | --- |
+| New | `PROCESSING` | Charge starts |
+| New | `CANCELLED` | Cancellation arrives before a charge |
+| `PROCESSING` | `SUCCEEDED` | Provider confirms the charge |
+| `PROCESSING` | `FAILED` | Provider rejects the charge or recovery times out |
+| `PROCESSING` | `CANCELLATION_PENDING` | Cancellation races the charge |
+| `CANCELLATION_PENDING` | `CANCELLED` | Cancellation wins |
+| `CANCELLATION_PENDING` | `SUCCEEDED` | Charge wins |
+| `SUCCEEDED` | `REFUNDED` | Refund succeeds |
+
+Refunds follow `New → PROCESSING → SUCCEEDED/FAILED`; retry moves `FAILED` back
+to `PROCESSING` on the same row with the same refund ID.
 
 `payments` contains one row per reservation and serializes payment/cancellation
 races with one row lock. A payloadless `CANCELLED` row is a durable tombstone
