@@ -19,7 +19,7 @@ public class ReservationExpiryJob {
         this.bookingRepository = bookingRepository;
     }
 
-    @Scheduled(fixedDelayString = "${booking.expiry-sweep-ms:30000}")
+    @Scheduled(fixedDelayString = "${booking.expiry-sweep-ms}")
     @Transactional
     public void releaseExpiredHolds() {
         bookingRepository.releaseExpiredHolds();

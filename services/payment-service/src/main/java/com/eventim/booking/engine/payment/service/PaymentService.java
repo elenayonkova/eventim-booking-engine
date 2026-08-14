@@ -37,7 +37,7 @@ public class PaymentService {
     public PaymentService(
             PaymentTransactions paymentTransactions,
             PaymentProvider paymentProvider,
-            @Value("${payment.simulation-enabled:true}") boolean simulationEnabled
+            @Value("${payment.simulation-enabled}") boolean simulationEnabled
     ) {
         this.paymentTransactions = paymentTransactions;
         this.paymentProvider = paymentProvider;
@@ -47,10 +47,8 @@ public class PaymentService {
     public PaymentResponse createPayment(PaymentRequest request, Long delayMs, String simulateFailure) {
         Simulation simulation = simulation(delayMs, simulateFailure);
         String fingerprint = fingerprint(request.paymentMethodToken());
-        UUID idempotencyKey = idempotencyKeyFor(request);
         ProviderStep<PaymentResponse> step = paymentTransactions.startPayment(
                 request,
-                idempotencyKey,
                 fingerprint);
 
         if (!step.providerCallRequired()) {
@@ -63,7 +61,7 @@ public class PaymentService {
                 step.response().paymentId(),
                 request,
                 simulation);
-        return paymentTransactions.completePayment(request, idempotencyKey, fingerprint, outcome);
+        return paymentTransactions.completePayment(request, fingerprint, outcome);
     }
 
     public PaymentResponse getPayment(UUID reservationId) {
@@ -96,13 +94,12 @@ public class PaymentService {
                 simulation);
         return paymentTransactions.completeCancellation(
                 request.reservationId(),
-                payment.paymentId(),
                 outcome);
     }
 
     public RefundResponse refund(RefundRequest request, Long delayMs, String simulateFailure) {
         Simulation simulation = simulation(delayMs, simulateFailure);
-        ProviderStep<RefundResponse> step = paymentTransactions.startRefund(request);
+        RefundStep step = paymentTransactions.startRefund(request);
 
         if (!step.providerCallRequired()) {
             return step.response();
@@ -118,6 +115,7 @@ public class PaymentService {
         return paymentTransactions.completeRefund(
                 request.reservationId(),
                 step.response().refundId(),
+                step.attempt(),
                 outcome);
     }
 
@@ -135,10 +133,6 @@ public class PaymentService {
         }
         validateSimulationDelay(delayMs);
         return simulation;
-    }
-
-    private UUID idempotencyKeyFor(PaymentRequest request) {
-        return request.reservationId();
     }
 
     private String fingerprint(String paymentMethodToken) {

@@ -16,7 +16,7 @@ public class PaymentReconciliationJob {
         this.checkoutService = checkoutService;
     }
 
-    @Scheduled(fixedDelayString = "${booking.payment-reconciliation-sweep-ms:30000}")
+    @Scheduled(fixedDelayString = "${booking.payment-reconciliation-sweep-ms}")
     public void reconcilePayments() {
         checkoutService.reconcilePendingPayments();
     }

@@ -11,7 +11,7 @@ public record ReservationRow(
         ReservationStatus status,
         OffsetDateTime expiresAt,
         UUID paymentId,
-        Long checkoutAmount,
+        long checkoutAmount,
         String checkoutCurrency,
         String paymentMethodFingerprint,
         OffsetDateTime checkoutStartedAt,

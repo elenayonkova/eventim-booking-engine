@@ -50,7 +50,8 @@ public class BookingRepository {
             return new SeatRow(
                     rs.getObject("id", UUID.class),
                     rs.getString("seat_label"),
-                    SeatStatus.valueOf(rs.getString("status")));
+                    SeatStatus.valueOf(rs.getString("status")),
+                    rs.getLong("price_amount"));
         }
     };
 
@@ -63,7 +64,7 @@ public class BookingRepository {
                     ReservationStatus.valueOf(rs.getString("status")),
                     rs.getObject("expires_at", OffsetDateTime.class),
                     rs.getObject("payment_id", UUID.class),
-                    rs.getObject("checkout_amount", Long.class),
+                    rs.getLong("checkout_amount"),
                     rs.getString("checkout_currency"),
                     rs.getString("payment_method_fingerprint"),
                     rs.getObject("checkout_started_at", OffsetDateTime.class),
@@ -79,9 +80,7 @@ public class BookingRepository {
                             rs.getObject("id", UUID.class),
                             rs.getString("seat_label"),
                             SeatStatus.valueOf(rs.getString("status")),
-                            rs.getObject("reservation_id", UUID.class),
-                            rs.getLong("price_amount"),
-                            rs.getString("currency"));
+                            rs.getObject("reservation_id", UUID.class));
                 }
             };
 
@@ -158,11 +157,18 @@ public class BookingRepository {
     }
 
     public boolean eventExists(String eventId) {
-        Integer count = jdbc.queryForObject(
-                "select count(*) from events where id = :eventId",
+        Boolean exists = jdbc.queryForObject(
+                "select exists(select 1 from events where id = :eventId)",
                 Map.of("eventId", eventId),
-                Integer.class);
-        return count != null && count > 0;
+                Boolean.class);
+        return Boolean.TRUE.equals(exists);
+    }
+
+    private String findEventCurrency(String eventId) {
+        return jdbc.queryForObject(
+                "select currency from events where id = :eventId",
+                Map.of("eventId", eventId),
+                String.class);
     }
 
     public List<SeatAvailabilityRow> findSeats(String eventId) {
@@ -181,6 +187,7 @@ public class BookingRepository {
         if (!eventExists(eventId)) {
             throw new NotFoundException("Event not found: " + eventId);
         }
+        String currency = findEventCurrency(eventId);
 
         List<String> sortedSeatLabels = normalizeSeatLabels(requestedSeatLabels);
         releaseExpiredHoldsForEvent(eventId);
@@ -191,7 +198,7 @@ public class BookingRepository {
 
         List<SeatRow> lockedSeats = jdbc.query(
                 """
-                select id, seat_label, status
+                select id, seat_label, status, price_amount
                 from seats
                 where event_id = :eventId
                   and seat_label in (:seatLabels)
@@ -227,19 +234,33 @@ public class BookingRepository {
             throw new ConflictException("Seats are not available: " + unavailableLabels);
         }
 
+        long amount = 0L;
+        for (SeatRow seat : lockedSeats) {
+            amount = Math.addExact(amount, seat.priceAmount());
+        }
+
         UUID reservationId = UUID.randomUUID();
         OffsetDateTime expiresAt = databaseNow().plus(holdTtl);
 
         jdbc.update(
                 """
-                insert into reservations (id, event_id, status, expires_at)
-                values (:id, :eventId, :status, :expiresAt)
+                insert into reservations (
+                    id,
+                    event_id,
+                    status,
+                    expires_at,
+                    checkout_amount,
+                    checkout_currency
+                )
+                values (:id, :eventId, :status, :expiresAt, :amount, :currency)
                 """,
                 new MapSqlParameterSource()
                         .addValue("id", reservationId)
                         .addValue("eventId", eventId)
                         .addValue("status", ReservationStatus.HELD.name())
-                        .addValue("expiresAt", expiresAt));
+                        .addValue("expiresAt", expiresAt)
+                        .addValue("amount", amount)
+                        .addValue("currency", currency));
 
         SqlParameterSource[] reservationSeatParams = new SqlParameterSource[lockedSeats.size()];
         List<UUID> seatIds = new ArrayList<>();
@@ -262,8 +283,7 @@ public class BookingRepository {
                 update seats
                 set status = 'HELD',
                     reservation_id = :reservationId,
-                    hold_expires_at = :expiresAt,
-                    version = version + 1
+                    hold_expires_at = :expiresAt
                 where id in (:seatIds)
                 """,
                 new MapSqlParameterSource()
@@ -271,7 +291,13 @@ public class BookingRepository {
                         .addValue("expiresAt", expiresAt)
                         .addValue("seatIds", seatIds));
 
-        return new ReservationInsertResult(reservationId, eventId, sortedSeatLabels, expiresAt);
+        return new ReservationInsertResult(
+                reservationId,
+                eventId,
+                sortedSeatLabels,
+                expiresAt,
+                amount,
+                currency);
     }
 
     public ReservationRow lockReservation(UUID reservationId) {
@@ -305,9 +331,7 @@ public class BookingRepository {
                 select seat.id,
                        seat.seat_label,
                        seat.status,
-                       seat.reservation_id,
-                       seat.price_amount,
-                       seat.currency
+                       seat.reservation_id
                 from reservation_seats reservation_seat
                 join seats seat on seat.id = reservation_seat.seat_id
                 where reservation_seat.reservation_id = :reservationId
@@ -320,16 +344,12 @@ public class BookingRepository {
 
     public void markPaymentPending(
             UUID reservationId,
-            long amount,
-            String currency,
             String paymentMethodFingerprint
     ) {
         int updated = jdbc.update(
                 """
                 update reservations
                 set status = 'PAYMENT_PENDING',
-                    checkout_amount = :amount,
-                    checkout_currency = :currency,
                     payment_method_fingerprint = :paymentMethodFingerprint,
                     checkout_started_at = now(),
                     payment_failure_reason = null,
@@ -339,8 +359,6 @@ public class BookingRepository {
                 """,
                 new MapSqlParameterSource()
                         .addValue("reservationId", reservationId)
-                        .addValue("amount", amount)
-                        .addValue("currency", currency)
                         .addValue("paymentMethodFingerprint", paymentMethodFingerprint));
         requireSingleUpdate(updated, "Reservation could not enter payment processing: " + reservationId);
     }
@@ -384,7 +402,7 @@ public class BookingRepository {
                 select id
                 from reservations
                 where status = 'PAYMENT_PENDING'
-                order by checkout_started_at, id
+                order by updated_at, id
                 limit 100
                 """,
                 UUID_ROW_MAPPER);
@@ -402,13 +420,25 @@ public class BookingRepository {
                 UUID_ROW_MAPPER);
     }
 
+    public void touchReconciliationAttempt(UUID reservationId, ReservationStatus status) {
+        jdbc.update(
+                """
+                update reservations
+                set updated_at = now()
+                where id = :reservationId
+                  and status = :status
+                """,
+                new MapSqlParameterSource()
+                        .addValue("reservationId", reservationId)
+                        .addValue("status", status.name()));
+    }
+
     public void bookSeats(UUID reservationId) {
         jdbc.update(
                 """
                 update seats
                 set status = 'BOOKED',
-                    hold_expires_at = null,
-                    version = version + 1
+                    hold_expires_at = null
                 where reservation_id = :reservationId
                   and status = 'HELD'
                 """,
@@ -503,7 +533,7 @@ public class BookingRepository {
     }
 
     public OffsetDateTime databaseNow() {
-        return jdbc.getJdbcTemplate().queryForObject("select now()", OffsetDateTime.class);
+        return jdbc.getJdbcTemplate().queryForObject("select clock_timestamp()", OffsetDateTime.class);
     }
 
     private void releaseHeldSeats(List<UUID> reservationIds) {
@@ -515,8 +545,7 @@ public class BookingRepository {
                 update seats
                 set status = 'AVAILABLE',
                     reservation_id = null,
-                    hold_expires_at = null,
-                    version = version + 1
+                    hold_expires_at = null
                 where reservation_id in (:reservationIds)
                   and status = 'HELD'
                 """,
@@ -557,7 +586,9 @@ public class BookingRepository {
             UUID reservationId,
             String eventId,
             List<String> seatIds,
-            OffsetDateTime expiresAt
+            OffsetDateTime expiresAt,
+            long amount,
+            String currency
     ) {
     }
 }

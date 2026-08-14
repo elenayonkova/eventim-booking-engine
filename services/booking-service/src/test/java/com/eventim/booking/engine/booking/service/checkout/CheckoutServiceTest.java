@@ -1,5 +1,6 @@
 package com.eventim.booking.engine.booking.service.checkout;
 
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -64,10 +65,34 @@ class CheckoutServiceTest {
     }
 
     @Test
+    void processingProviderResultReturnsPendingWithoutChargingAgain() {
+        UUID reservationId = UUID.randomUUID();
+        UUID paymentId = UUID.randomUUID();
+        CheckoutRequest request = new CheckoutRequest(reservationId, "pm-test");
+        CheckoutSnapshot pending = pendingCheckout(reservationId);
+        PaymentResult processing = payment(paymentId, reservationId, PaymentStatus.PROCESSING);
+        CheckoutSnapshot stored = pending.withPaymentResult(
+                paymentId,
+                ReservationStatus.PAYMENT_PENDING,
+                null);
+        when(reservationCheckout.beginCheckout(eq(reservationId), anyString()))
+                .thenReturn(pending);
+        when(paymentGateway.charge(any())).thenReturn(processing);
+        when(reservationCheckout.applyPaymentResult(pending, processing)).thenReturn(stored);
+
+        var response = checkoutService.checkout(request, null, null);
+
+        assertThat(response.status()).isEqualTo(ReservationStatus.PAYMENT_PENDING);
+        assertThat(response.paymentId()).isEqualTo(paymentId);
+        verify(paymentGateway).charge(any());
+        verify(paymentGateway, never()).refund(any());
+    }
+
+    @Test
     void missingPaymentBeforeTimeoutIsLeftPendingWithoutCancellation() {
         UUID reservationId = UUID.randomUUID();
         Duration timeout = Duration.ofMinutes(3);
-        CheckoutStep checkout = pendingCheckout(reservationId);
+        CheckoutSnapshot checkout = pendingCheckout(reservationId);
         when(bookingRepository.findPaymentPendingReservationIds()).thenReturn(List.of(reservationId));
         when(bookingRepository.findRefundRequiredReservationIds()).thenReturn(List.of());
         when(reservationCheckout.loadPaymentPendingCheckout(reservationId)).thenReturn(checkout);
@@ -86,7 +111,7 @@ class CheckoutServiceTest {
     void cancellationForAnotherReservationDoesNotFailThePendingCheckout() {
         UUID reservationId = UUID.randomUUID();
         Duration timeout = Duration.ofMinutes(3);
-        CheckoutStep checkout = pendingCheckout(reservationId);
+        CheckoutSnapshot checkout = pendingCheckout(reservationId);
         when(bookingRepository.findPaymentPendingReservationIds()).thenReturn(List.of(reservationId));
         when(bookingRepository.findRefundRequiredReservationIds()).thenReturn(List.of());
         when(reservationCheckout.loadPaymentPendingCheckout(reservationId)).thenReturn(checkout);
@@ -108,9 +133,12 @@ class CheckoutServiceTest {
         UUID failingReservationId = UUID.randomUUID();
         UUID succeedingReservationId = UUID.randomUUID();
         UUID paymentId = UUID.randomUUID();
-        CheckoutStep pending = pendingCheckout(succeedingReservationId);
+        CheckoutSnapshot pending = pendingCheckout(succeedingReservationId);
         PaymentResult succeeded = payment(paymentId, succeedingReservationId, PaymentStatus.SUCCEEDED);
-        CheckoutStep completed = pending.asResponse(paymentId, ReservationStatus.BOOKED, null);
+        CheckoutSnapshot completed = pending.withPaymentResult(
+                paymentId,
+                ReservationStatus.BOOKED,
+                null);
         when(bookingRepository.findPaymentPendingReservationIds())
                 .thenReturn(List.of(failingReservationId, succeedingReservationId));
         when(bookingRepository.findRefundRequiredReservationIds()).thenReturn(List.of());
@@ -131,7 +159,7 @@ class CheckoutServiceTest {
         UUID reservationId = UUID.randomUUID();
         UUID paymentId = UUID.randomUUID();
         UUID refundId = UUID.randomUUID();
-        CheckoutStep refundRequired = CheckoutStep.refund(new ReservationRow(
+        CheckoutSnapshot refundRequired = CheckoutSnapshot.from(new ReservationRow(
                 reservationId,
                 "event-1",
                 ReservationStatus.REFUND_REQUIRED,
@@ -160,12 +188,15 @@ class CheckoutServiceTest {
         verify(reservationCheckout, never()).markRefunded(any(), any());
     }
 
-    private CheckoutStep pendingCheckout(UUID reservationId) {
-        return CheckoutStep.startedCharge(
+    private CheckoutSnapshot pendingCheckout(UUID reservationId) {
+        return new CheckoutSnapshot(
                 reservationId,
+                null,
+                ReservationStatus.PAYMENT_PENDING,
                 AMOUNT,
                 CURRENCY,
-                FINGERPRINT);
+                FINGERPRINT,
+                null);
     }
 
     private PaymentResult payment(UUID paymentId, UUID reservationId, PaymentStatus status) {

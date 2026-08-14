@@ -15,8 +15,8 @@ import com.eventim.booking.engine.booking.api.CheckoutRequest;
 import com.eventim.booking.engine.booking.api.CheckoutResponse;
 import com.eventim.booking.engine.booking.config.BookingProperties;
 import com.eventim.booking.engine.booking.payment.ChargePayment;
-import com.eventim.booking.engine.booking.payment.PaymentGateway;
 import com.eventim.booking.engine.booking.payment.PaymentCancellationResult;
+import com.eventim.booking.engine.booking.payment.PaymentGateway;
 import com.eventim.booking.engine.booking.payment.PaymentResult;
 import com.eventim.booking.engine.booking.payment.PaymentSimulation;
 import com.eventim.booking.engine.booking.payment.RefundResult;
@@ -26,8 +26,8 @@ import com.eventim.booking.engine.booking.service.ConflictException;
 import com.eventim.booking.engine.booking.service.ExternalServiceException;
 
 /**
- * Coordinates the checkout workflow and external payment calls. Local state
- * transitions are delegated to {@link ReservationCheckout}.
+ * Coordinates checkout and external payment calls. Reservation status is the
+ * only dispatcher; all local transitions are owned by {@link ReservationCheckout}.
  */
 @Service
 public class CheckoutService {
@@ -57,12 +57,11 @@ public class CheckoutService {
             String simulatedFailure
     ) {
         PaymentSimulation simulation = new PaymentSimulation(simulatedDelayMs, simulatedFailure);
-        String paymentMethodFingerprint = fingerprint(request.paymentMethodToken());
-        CheckoutStep checkout = reservationCheckout.beginCheckout(
+        CheckoutSnapshot checkout = reservationCheckout.beginCheckout(
                 request.reservationId(),
-                paymentMethodFingerprint);
+                fingerprint(request.paymentMethodToken()));
 
-        return performCheckoutAction(checkout, request, simulation);
+        return continuePreparedCheckout(checkout, request, simulation);
     }
 
     public void reconcilePendingPayments() {
@@ -82,28 +81,33 @@ public class CheckoutService {
         }
     }
 
-    private CheckoutResponse performCheckoutAction(
-            CheckoutStep checkout,
+    private CheckoutResponse continuePreparedCheckout(
+            CheckoutSnapshot checkout,
             CheckoutRequest request,
             PaymentSimulation simulation
     ) {
-        if (checkout.action() == CheckoutStep.Action.RETURN) {
-            return checkout.toResponse();
+        switch (checkout.status()) {
+            case PAYMENT_PENDING:
+                return chargeAndApplyPayment(request, simulation, checkout);
+            case REFUND_REQUIRED:
+                return refundAndFinalize(checkout);
+            case BOOKED:
+            case PAYMENT_FAILED:
+            case REFUNDED:
+                return checkout.toResponse();
+            case EXPIRED:
+                throw reservationExpired(checkout.reservationId());
+            case HELD:
+            default:
+                throw new IllegalStateException(
+                        "Checkout preparation returned state " + checkout.status());
         }
-        if (checkout.action() == CheckoutStep.Action.EXPIRED) {
-            throw reservationExpired(request.reservationId());
-        }
-        if (checkout.action() == CheckoutStep.Action.REFUND) {
-            return refundAndFinalize(checkout);
-        }
-
-        return chargeAndApplyPayment(request, simulation, checkout);
     }
 
     private CheckoutResponse chargeAndApplyPayment(
             CheckoutRequest request,
             PaymentSimulation simulation,
-            CheckoutStep checkout
+            CheckoutSnapshot checkout
     ) {
         PaymentResult payment = paymentGateway.charge(new ChargePayment(
                 request.reservationId(),
@@ -111,75 +115,75 @@ public class CheckoutService {
                 checkout.currency(),
                 request.paymentMethodToken(),
                 simulation));
-
         return applyPaymentResult(checkout, payment);
     }
 
     private void reconcilePendingPayment(UUID reservationId) {
-        CheckoutStep checkout = reservationCheckout.loadPaymentPendingCheckout(reservationId);
+        CheckoutSnapshot checkout = reservationCheckout.loadPaymentPendingCheckout(reservationId);
         if (checkout == null) {
             return;
         }
 
         Optional<PaymentResult> payment = paymentGateway.find(reservationId);
-        if (payment.isEmpty()) {
-            CheckoutStep timedOutCheckout = reservationCheckout.loadTimedOutPaymentPendingCheckout(
-                    reservationId,
-                    bookingProperties.paymentPendingTimeout());
-            if (timedOutCheckout == null) {
-                return;
-            }
-
-            PaymentCancellationResult cancellation = paymentGateway.cancel(reservationId);
-            if (!reservationId.equals(cancellation.reservationId())) {
-                throw new ExternalServiceException(
-                        "Payment service cancelled another reservation");
-            }
-            if (cancellation.payment() == null) {
-                reservationCheckout.failPaymentAfterCancellation(timedOutCheckout);
-                return;
-            }
-
-            applyPaymentResult(timedOutCheckout, cancellation.payment());
+        if (payment.isPresent()) {
+            applyPaymentResult(checkout, payment.get());
             return;
         }
 
-        applyPaymentResult(checkout, payment.get());
+        CheckoutSnapshot timedOutCheckout = reservationCheckout.loadTimedOutPaymentPendingCheckout(
+                reservationId,
+                bookingProperties.paymentPendingTimeout());
+        if (timedOutCheckout == null) {
+            return;
+        }
+
+        PaymentCancellationResult cancellation = paymentGateway.cancel(reservationId);
+        if (!reservationId.equals(cancellation.reservationId())) {
+            throw new ExternalServiceException("Payment service cancelled another reservation");
+        }
+        if (cancellation.payment() == null) {
+            reservationCheckout.failPaymentAfterCancellation(timedOutCheckout);
+            return;
+        }
+
+        applyPaymentResult(timedOutCheckout, cancellation.payment());
     }
 
     private void reconcileRequiredRefund(UUID reservationId) {
-        CheckoutStep checkout = reservationCheckout.loadRefundRequiredCheckout(reservationId);
+        CheckoutSnapshot checkout = reservationCheckout.loadRefundRequiredCheckout(reservationId);
         if (checkout != null) {
             refundAndFinalize(checkout);
         }
     }
 
-    private CheckoutResponse applyPaymentResult(CheckoutStep checkout, PaymentResult payment) {
-        CheckoutStep updated = reservationCheckout.applyPaymentResult(checkout, payment);
-        return completeNonChargeAction(updated);
+    private CheckoutResponse applyPaymentResult(
+            CheckoutSnapshot checkout,
+            PaymentResult payment
+    ) {
+        CheckoutSnapshot updated = reservationCheckout.applyPaymentResult(checkout, payment);
+        switch (updated.status()) {
+            case REFUND_REQUIRED:
+                return refundAndFinalize(updated);
+            case PAYMENT_PENDING:
+            case BOOKED:
+            case PAYMENT_FAILED:
+            case REFUNDED:
+                return updated.toResponse();
+            case HELD:
+            case EXPIRED:
+            default:
+                throw new IllegalStateException(
+                        "Payment result produced state " + updated.status());
+        }
     }
 
-    private CheckoutResponse refundAndFinalize(CheckoutStep checkout) {
+    private CheckoutResponse refundAndFinalize(CheckoutSnapshot checkout) {
         RefundResult refund = paymentGateway.refund(checkout.reservationId());
         if (refund.status() != RefundStatus.SUCCEEDED) {
             throw new ExternalServiceException("Refund is still unresolved; retry checkout safely");
         }
 
-        CheckoutStep completed = reservationCheckout.markRefunded(checkout, refund);
-        return completed.toResponse();
-    }
-
-    private CheckoutResponse completeNonChargeAction(CheckoutStep checkout) {
-        if (checkout.action() == CheckoutStep.Action.RETURN) {
-            return checkout.toResponse();
-        }
-        if (checkout.action() == CheckoutStep.Action.REFUND) {
-            return refundAndFinalize(checkout);
-        }
-        if (checkout.action() == CheckoutStep.Action.EXPIRED) {
-            throw reservationExpired(checkout.reservationId());
-        }
-        throw new IllegalStateException("Checkout action still requires payment");
+        return reservationCheckout.markRefunded(checkout, refund).toResponse();
     }
 
     private ConflictException reservationExpired(UUID reservationId) {

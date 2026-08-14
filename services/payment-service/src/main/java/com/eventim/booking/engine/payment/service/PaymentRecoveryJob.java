@@ -21,7 +21,7 @@ public class PaymentRecoveryJob {
         this.paymentRepository = paymentRepository;
     }
 
-    @Scheduled(fixedDelayString = "${payment.recovery-sweep-ms:30000}")
+    @Scheduled(fixedDelayString = "${payment.recovery-sweep-ms}")
     @Transactional
     public void failInterruptedPayments() {
         Duration timeout = Duration.ofMinutes(2);
@@ -29,7 +29,6 @@ public class PaymentRecoveryJob {
         // outcomes outside a database transaction before applying recovered states.
         // The simulator can only mark interrupted local attempts as failed.
         paymentRepository.failStaleProcessingPayments(timeout);
-        paymentRepository.finalizeFailedCancellationIntents();
         paymentRepository.failStaleProcessingRefunds(timeout);
     }
 }

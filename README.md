@@ -1,344 +1,190 @@
 # Eventim High-Concurrency Booking Engine
 
-This project is a ticket booking system built with Java 17, Spring Boot,
-PostgreSQL, Kubernetes kind, and Carvel.
+A Java 17, Spring Boot, and PostgreSQL ticket-booking exercise focused on
+concurrent seat allocation, idempotent payments, and recovery across external
+calls.
 
-The main goal is to protect seats and payments when many customers use the
-system at the same time. The system must not sell one seat twice or charge one
-reservation twice.
+## Guarantees
 
-## What is included
+- Multi-seat holds succeed completely or not at all.
+- Fixed-order row locking prevents double booking and reduces deadlocks.
+- Reservation creation snapshots the authoritative amount and event currency.
+- Checkout never holds a database transaction open during an external call.
+- Payment and refund retries reuse one reservation-scoped aggregate.
+- Expiry, cancellation, late completion, and refund recovery are durable.
+- Database constraints reject invalid reservation, seat, and payment states.
 
-- A customer can hold one or more seats for a short time.
-- A multi-seat request holds all requested seats or none of them.
-- PostgreSQL row locks prevent two customers from holding the same seat.
-- Expired holds are released automatically.
-- The server calculates the price. It does not trust a price sent by a client.
-- Payment and refund requests are idempotent. This means a safe retry does not
-  create a second payment or refund.
-- The system can recover when a payment response is delayed or lost.
-- If payment succeeds but booking cannot finish, the system requests a refund.
-- Flyway manages database changes, and database constraints block invalid seat
-  states.
-- Docker Compose provides a quick local setup.
-- Carvel and kind provide a local Kubernetes setup with two copies of each
-  service, health checks, resource limits, and persistent PostgreSQL storage.
-- Integration tests cover concurrent reservations and payment edge cases.
-
-## Architecture
+## Design
 
 ```mermaid
 flowchart LR
-  Client["Client"] --> K8s["Kubernetes Service"]
-  K8s --> Booking["Booking Service ×2"]
+  Client --> Booking["Booking Service"]
   Booking --> BookingDb["PostgreSQL booking schema"]
-  Booking --> Payment["Payment Service ×2"]
+  Booking --> Payment["Payment Service"]
   Payment --> PaymentDb["PostgreSQL payment schema"]
-  Booking -. "check an unknown payment result" .-> Payment
+  Payment --> Provider["Simulated provider"]
 ```
 
-The Booking Service and Payment Service do not keep important state in memory.
-PostgreSQL is the source of truth. Because of this, a request can go to any
-service instance and the same rules still apply.
+Both services are stateless; PostgreSQL is the source of truth. Kubernetes can
+run two replicas of each service without in-memory coordination.
 
-### How seat reservations stay correct
+### Reservations and checkout
 
-The Booking Service locks requested seat rows in a fixed order. It creates a
-reservation only when every requested seat exists and is `AVAILABLE`.
-
-For example, if a customer asks for seats A-1 and A-2 but A-2 is already held,
-the request fails. A-1 is not held on its own. This prevents partial bookings
-and also reduces the risk of database deadlocks.
-
-Expired reservations are processed in small batches. `FOR UPDATE SKIP LOCKED`
-allows more than one Booking Service instance to run this work safely.
-
-### Reservation lifecycle
-
-The reservation status records the durable checkout decision. Seat state is
-updated in the same transaction as each reservation transition.
+Reservation creation locks every requested seat in a stable order, verifies
+that all are `AVAILABLE`, and stores the seat-price total plus the event
+currency. Checkout then uses that immutable reservation snapshot while locking
+seat rows only for ownership and transition safety.
 
 ```mermaid
 stateDiagram-v2
-  [*] --> HELD: reservation created
-  HELD --> EXPIRED: hold expires
-  HELD --> PAYMENT_PENDING: checkout begins
-  PAYMENT_PENDING --> PAYMENT_PENDING: payment is still processing
+  [*] --> HELD
+  HELD --> EXPIRED
+  HELD --> PAYMENT_PENDING
+  PAYMENT_PENDING --> PAYMENT_PENDING: provider still processing
   PAYMENT_PENDING --> BOOKED: matching payment succeeds
-  PAYMENT_PENDING --> PAYMENT_FAILED: payment fails or cancellation is confirmed
-  PAYMENT_PENDING --> REFUND_REQUIRED: successful payment cannot be applied safely
-  PAYMENT_PENDING --> REFUNDED: payment was already refunded
-  REFUND_REQUIRED --> REFUND_REQUIRED: refund is unresolved
+  PAYMENT_PENDING --> PAYMENT_FAILED: payment fails or is cancelled
+  PAYMENT_PENDING --> REFUND_REQUIRED: successful payment cannot be applied
   REFUND_REQUIRED --> REFUNDED: refund succeeds
-  EXPIRED --> [*]
-  BOOKED --> [*]
-  PAYMENT_FAILED --> [*]
-  REFUNDED --> [*]
+  PAYMENT_PENDING --> REFUNDED: payment was already refunded
 ```
 
-`BOOKED` moves the held seats to `BOOKED`. Expiry or payment failure releases
-them to `AVAILABLE`. A successful payment that cannot be applied safely enters
-`REFUND_REQUIRED` and releases the seats before the refund call; `REFUNDED`
-records that the financial recovery completed.
+Reservation status alone selects the next checkout operation:
 
-### How checkout stays correct
+| Status | Operation |
+| --- | --- |
+| `PAYMENT_PENDING` | Create or return the payment |
+| `REFUND_REQUIRED` | Create or return the refund |
+| `BOOKED`, `PAYMENT_FAILED`, `REFUNDED` | Return the stored response |
+| `EXPIRED` | Return HTTP 409 after committing expiry |
 
-The Booking Service does not keep a database transaction open while it waits for
-the Payment Service, and the Payment Service does not keep one open while it
-waits for the provider. A first checkout follows these transaction boundaries:
+A `PROCESSING` payment returns `PAYMENT_PENDING`; it never starts another
+charge. Only `REFUND_REQUIRED` triggers a second external operation.
+
+### Payments and refunds
 
 ```mermaid
-sequenceDiagram
-  actor Client
-  participant Booking as Booking Service
-  participant Payment as Payment Service
-  participant Provider as Payment Provider
-
-  Client->>Booking: POST /v1/checkout
-  Booking->>Booking: DB tx: save PAYMENT_PENDING
-  Booking->>Payment: Create or return payment
-  Payment->>Payment: DB tx: save PROCESSING
-  Note over Payment,Provider: The provider call runs after the commit
-  Payment->>Provider: Charge
-  Provider-->>Payment: Succeeded or failed
-  Payment->>Payment: DB tx: save final status
-  Payment-->>Booking: Payment result
-
-  alt Matching payment succeeded
-    Booking->>Booking: DB tx: book seats and mark BOOKED
-    Booking-->>Client: BOOKED
-  else Payment failed
-    Booking->>Booking: DB tx: mark PAYMENT_FAILED and release seats
-    Booking-->>Client: PAYMENT_FAILED
-  else Successful payment cannot be applied safely
-    Booking->>Booking: DB tx: mark REFUND_REQUIRED and release seats
-    Note over Booking,Payment: Continue with the refund flow below
-  end
+stateDiagram-v2
+  [*] --> PROCESSING: payment starts
+  [*] --> CANCELLED: cancellation tombstone
+  PROCESSING --> SUCCEEDED
+  PROCESSING --> FAILED
+  PROCESSING --> CANCELLATION_PENDING
+  CANCELLATION_PENDING --> CANCELLED
+  CANCELLATION_PENDING --> SUCCEEDED
+  SUCCEEDED --> REFUNDED
 ```
 
-If a successful charge cannot be applied safely, refund recovery follows the
-same durable start, provider call, and completion pattern:
+`payments` contains one row per reservation and serializes payment/cancellation
+races with one row lock. A payloadless `CANCELLED` row is a durable tombstone
+that prevents a later charge; it is not returned as a normal payment.
 
-```mermaid
-sequenceDiagram
-  actor Client
-  participant Booking as Booking Service
-  participant Payment as Payment Service
-  participant Provider as Payment Provider
+Refunds use one separate row per reservation. A failed refund atomically moves
+back to `PROCESSING`, keeps the same refund ID, and increments `attempt` so an
+older completion cannot overwrite the retry. Existing `PROCESSING` or
+`SUCCEEDED` results do not start duplicate provider work.
 
-  Booking->>Payment: Refund reservation
-  Payment->>Payment: DB tx: save PROCESSING refund
-  Note over Payment,Provider: The provider call runs after the commit
-  Payment->>Provider: Refund
-  Provider-->>Payment: Succeeded or failed
-  Payment->>Payment: DB tx: save final refund status
-  Payment-->>Booking: Refund result
+Booking reconciliation is ordered by `reservations.updated_at`. Payment and
+refund `updated_at` values track provider attempts, so polling an existing
+`PROCESSING` result cannot postpone interrupted-attempt recovery.
 
-  alt Refund succeeded
-    Booking->>Booking: DB tx: mark REFUNDED
-    Booking-->>Client: REFUNDED
-  else Refund failed or is unresolved
-    Booking->>Booking: Keep REFUND_REQUIRED
-    Booking-->>Client: 503, retry safely
-  end
-```
+### Persistence
 
-The reservation ID is used as the payment idempotency key. If the same checkout
-is sent again, the Payment Service returns the existing payment. It does not
-create another charge.
+Each service has one final-state Flyway V1 baseline:
 
-If the payment response is lost or takes too long, the Booking Service keeps the
-reservation in `PAYMENT_PENDING`. The client can retry safely, and a background
-job follows this recovery flow:
+- [Booking schema](services/booking-service/src/main/resources/db/migration/V1__create_booking_tables.sql)
+- [Payment schema](services/payment-service/src/main/resources/db/migration/V1__create_payment_tables.sql)
 
-```mermaid
-flowchart TD
-  Pending["Reservation PAYMENT_PENDING"] --> Lookup{"Payment lookup result?"}
-  Lookup -->|PROCESSING| Keep["Keep PAYMENT_PENDING for the next sweep"]
-  Lookup -->|Final result| Apply["Verify and apply result"]
-  Lookup -->|404| Timeout{"Reconciliation timeout elapsed?"}
-  Timeout -->|No| Keep
-  Timeout -->|Yes| Cancel["Cancel reservation-scoped intent"]
-
-  Cancel --> Exists{"Payment exists when cancellation locks the intent?"}
-  Exists -->|No| Tombstone["Save durable CANCELLED tombstone"]
-  Tombstone --> Failed["Mark PAYMENT_FAILED and release seats"]
-
-  Exists -->|Started during race| CancelPending["Save CANCELLATION_PENDING"]
-  CancelPending --> Provider["Provider cancels or resolves the charge"]
-  Provider -->|Cancellation wins| Cancelled["Payment FAILED and intent CANCELLED"]
-  Cancelled --> Failed
-  Provider -->|Charge wins| Succeeded["Payment SUCCEEDED and intent ACTIVE"]
-  Succeeded --> Apply
-```
-
-Before applying any recovered result, the Booking Service verifies the amount,
-currency, and payment-token fingerprint against the stored checkout. A
-successful mismatched payment is refunded instead of booking seats. The durable
-cancellation handshake prevents a late payment from succeeding after its seats
-have been released.
-
-The Payment Service saves a `PROCESSING` payment or refund before the simulated
-provider delay, then applies the final result in a separate transaction.
-Unique constraints on `reservation_id` and `INSERT ... ON CONFLICT` collapse
-concurrent payment or refund retries into one durable record. A retry with a
-different amount, currency, or payment token is rejected.
-
-### Seat and reservation relationship
-
-`reservation_seats` is the main many-to-many table. It records which seats
-belong to each reservation.
-
-`seats.reservation_id` also stores the reservation that currently owns a seat.
-This is intentional duplication. It makes the most important availability
-checks simple and fast.
-
-Both values are changed in the same database transaction. Database constraints
-also enforce these rules:
-
-- `AVAILABLE`: no reservation and no expiry time.
-- `HELD`: a reservation and an expiry time are present.
-- `BOOKED`: a reservation is present, but there is no expiry time.
-
-`reservation_seats` keeps the reservation history. `seats.reservation_id` shows
-only the current owner of the seat.
+`reservation_seats` records the allocation. `seats.reservation_id` intentionally
+caches the current owner for simple availability and concurrency checks. Both
+are updated in the same transaction.
 
 ## API
 
-Booking Service (`:8080`):
+| Service | Method | Path | Purpose |
+| --- | --- | --- | --- |
+| Booking | `GET` | `/v1/events/{eventId}/seats` | List availability |
+| Booking | `POST` | `/v1/reservations` | Hold seats |
+| Booking | `POST` | `/v1/checkout` | Complete checkout |
+| Payment | `POST` | `/v1/payments` | Create or return a payment |
+| Payment | `GET` | `/v1/payments/by-reservation/{id}` | Reconcile a payment |
+| Payment | `POST` | `/v1/payments/cancellations` | Cancel or resolve a payment race |
+| Payment | `POST` | `/v1/refunds` | Create, return, or retry a refund |
+| Both | `GET` | `/actuator/health` | Health check |
 
-| Method | Path | Purpose |
-| --- | --- | --- |
-| `GET` | `/v1/events/{eventId}/seats` | Show current seat availability and release expired holds for the event |
-| `POST` | `/v1/reservations` | Hold one or more seats |
-| `POST` | `/v1/checkout` | Pay for and complete a reservation |
-| `GET` | `/actuator/health` | Check service health |
+When simulation is enabled, `X-Simulate-Delay-Ms` delays the provider by up to
+60 seconds and `X-Simulate-Failure: true` requests a failed operation.
 
-Payment Service (`:8081`, internal in Kubernetes):
+## Run locally
 
-| Method | Path | Purpose |
-| --- | --- | --- |
-| `POST` | `/v1/payments` | Create a payment or return the existing payment |
-| `GET` | `/v1/payments/by-reservation/{reservationId}` | Find a payment during recovery |
-| `POST` | `/v1/payments/cancellations` | Prevent a late payment or return the payment that won the race |
-| `POST` | `/v1/refunds` | Create a refund or return the existing refund |
-| `GET` | `/actuator/health` | Check service health |
-
-Checkout forwards the following headers only when creating a payment. Direct
-calls to the Payment Service accept the same headers on payment creation,
-cancellation, and refund creation while `PAYMENT_SIMULATION_ENABLED` is true:
-
-- `X-Simulate-Delay-Ms`: delay the simulated provider response by up to 60,000 ms.
-- `X-Simulate-Failure: true`: complete a payment or refund as failed. For a
-  cancellation, it simulates the charge winning the race, so the payment
-  completes as `SUCCEEDED`.
-
-## Run with Docker Compose
-
-You need Docker Desktop with Docker Compose.
+Requirements: Docker Desktop, Docker Compose, `curl`, `jq`, and `uuidgen`.
 
 ```bash
 docker compose up --build
+./scripts/smoke-test.sh
 ```
 
-Example requests:
+The smoke test verifies health, atomic holds, overlap conflicts, successful and
+failed checkout, idempotent retry, cancellation tombstones, seat release, and a
+failed refund retried successfully with the same ID. A verified run is in
+[demo/smoke-test-output.txt](demo/smoke-test-output.txt).
 
-```bash
-curl http://localhost:8080/v1/events/event-1/seats
+The Flyway V1 seed creates `event-1` with currency `EUR` and twenty seats priced
+at `5000` minor units each. Therefore, holding two demo seats produces a
+reservation snapshot of `amount: 10000` and `currency: "EUR"`. These are seed
+values from the booking V1 SQL, not application configuration defaults.
 
-curl -X POST http://localhost:8080/v1/reservations \
-  -H 'Content-Type: application/json' \
-  -d '{"eventId":"event-1","seatIds":["A-1","A-2"]}'
-
-curl -X POST http://localhost:8080/v1/checkout \
-  -H 'Content-Type: application/json' \
-  -d '{"reservationId":"REPLACE_ME","paymentMethodToken":"tok_example"}'
-```
-
-Stop the services without deleting the database data:
+Stop without deleting data:
 
 ```bash
 docker compose down
 ```
 
+If a local database was created using the previous migration chain, recreate
+that disposable database or Compose volume because its Flyway history is
+incompatible with the consolidated V1 checksum.
+
 ## Run on kind with Carvel
 
-You need Docker Desktop, `kubectl`, `kind`, `ytt`, `kbld`, `kapp`, and `kctrl`.
-
-Run:
+Requirements: Docker Desktop, `kubectl`, `kind`, `ytt`, `kbld`, `kapp`, and
+`kctrl`.
 
 ```bash
 ./scripts/setup.sh
-```
-
-The script:
-
-1. Creates or reuses the `eventim` kind cluster.
-2. Installs kapp-controller `v0.60.1`.
-3. Builds the service images with kbld.
-4. Loads the images into kind.
-5. Creates and installs the Carvel package.
-6. Waits until the services are ready.
-
-Open the Booking Service on your computer:
-
-```bash
 kubectl port-forward --namespace eventim service/booking-service 8080:8080
 ```
 
-Check the installation:
+The setup script creates or reuses the `eventim` kind cluster, installs
+kapp-controller, builds and loads both images, installs the Carvel package, and
+waits for readiness.
 
 ```bash
 kctrl package installed get \
   --package-install eventim-booking-engine \
   --namespace eventim-install
-
-kapp list --namespace eventim
 kubectl get pods --namespace eventim
 ```
 
-The local installer uses cluster-admin permission because it creates a
-namespace and all required resources in a disposable kind cluster. A production
-setup should use smaller, pre-created permissions.
-
 ## Tests
 
-Docker must be running. The tests use Testcontainers and PostgreSQL 17, and the
-build fails rather than silently skipping the suites when Docker is unavailable.
+Docker must be running because integration tests use PostgreSQL 17 through
+Testcontainers.
 
 ```bash
 mvn test
 ```
 
-The tests check that:
+The 58 tests cover high-contention seat allocation, all-or-nothing multi-seat
+holds, expiry commits, reservation price snapshots, checkout states,
+idempotency, cancellation/payment races, late completions, and refund retries.
 
-- only one concurrent request can win the same seat;
-- an overlapping multi-seat request does not create a partial hold;
-- expired holds release their seats;
-- successful, failed, repeated, and delayed checkouts work correctly;
-- concurrent payment requests create only one payment;
-- the same payment key cannot be reused with different payment details;
-- mismatched recovered payments are refunded instead of booking seats;
-- cancellation tombstones prevent late payments after seats are released;
-- refund responses must match the stored reservation and payment;
-- stale recovery cannot be overwritten by late payment completion; and
-- excessive simulated delays are rejected before work starts.
+## Demo
 
-## Confirmed exercise scope
+- [Five-minute recorded walkthrough](demo/eventim-booking-engine-demo.mp4)
+- Shared download after pushing:
+  `https://github.com/elenayonkova/eventim-booking-engine/raw/main/demo/eventim-booking-engine-demo.mp4`
 
-The following points were confirmed after the assignment questions were sent:
+## Exercise scope
 
-- Customers may remain anonymous. Authentication and reservation ownership are
-  not required.
-- The required Payment Service is the simulated Java service in this repository.
-  An external payment provider is not required.
-- A reproducible local deployment with kind, Carvel, and `scripts/setup.sh` is
-  enough. Public hosting is not required.
-- There is no fixed throughput target. The important requirement is safe
-  concurrent behavior without race conditions, double bookings, or inventory
-  leaks.
-- Database partitioning is not required.
-
-The implementation therefore focuses on concurrency, payment idempotency and
-recovery, automated tests, and a reproducible local deployment.
-
+Customers are anonymous, the provider is simulated, public hosting and database
+partitioning are not required, and correctness under concurrency is prioritized
+over a fixed throughput target.

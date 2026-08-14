@@ -7,6 +7,7 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.time.OffsetDateTime;
+import java.util.ArrayList;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.UUID;
@@ -83,15 +84,16 @@ class BookingServiceIntegrationTest {
                 set status = 'AVAILABLE',
                     reservation_id = null,
                     hold_expires_at = null,
-                    version = 0
+                    price_amount = 5000
                 """);
         jdbc.update("delete from booking.reservation_seats");
         jdbc.update("delete from booking.reservations");
     }
 
     @Test
-    void onlyOneConcurrentReservationCanHoldTheSameSeat() throws Exception {
-        CountDownLatch ready = new CountDownLatch(2);
+    void exactlyOneOfManyConcurrentReservationsCanHoldTheSameSeat() throws Exception {
+        int requestCount = 24;
+        CountDownLatch ready = new CountDownLatch(requestCount);
         CountDownLatch start = new CountDownLatch(1);
         Callable<Object> attempt = () -> {
             ready.countDown();
@@ -104,16 +106,23 @@ class BookingServiceIntegrationTest {
             }
         };
 
-        ExecutorService executor = Executors.newFixedThreadPool(2);
+        ExecutorService executor = Executors.newFixedThreadPool(requestCount);
         try {
-            Future<Object> first = executor.submit(attempt);
-            Future<Object> second = executor.submit(attempt);
+            List<Future<Object>> requests = new ArrayList<>();
+            for (int index = 0; index < requestCount; index++) {
+                requests.add(executor.submit(attempt));
+            }
             ready.await();
             start.countDown();
 
-            List<Object> outcomes = List.of(first.get(), second.get());
+            List<Object> outcomes = new ArrayList<>();
+            for (Future<Object> request : requests) {
+                outcomes.add(request.get());
+            }
             assertThat(outcomes).filteredOn(ReservationResponse.class::isInstance).hasSize(1);
-            assertThat(outcomes).filteredOn(ConflictException.class::isInstance).hasSize(1);
+            assertThat(outcomes)
+                    .filteredOn(ConflictException.class::isInstance)
+                    .hasSize(requestCount - 1);
         } finally {
             executor.shutdownNow();
         }
@@ -161,6 +170,8 @@ class BookingServiceIntegrationTest {
     void successfulCheckoutBooksEverySeatAndIsRetrySafe() {
         ReservationResponse reservation = bookingService.createReservation(
                 new CreateReservationRequest("event-1", List.of("A-1", "A-2")));
+        assertThat(reservation.amount()).isEqualTo(10_000);
+        assertThat(reservation.currency()).isEqualTo("EUR");
         UUID paymentId = UUID.randomUUID();
         org.mockito.Mockito.when(paymentGateway.charge(new ChargePayment(
                         reservation.reservationId(),
@@ -195,6 +206,38 @@ class BookingServiceIntegrationTest {
                         "EUR",
                         "pm-test",
                         new PaymentSimulation(null, null)));
+    }
+
+    @Test
+    void checkoutUsesPriceCapturedWhenTheReservationWasCreated() {
+        ReservationResponse reservation = bookingService.createReservation(
+                new CreateReservationRequest("event-1", List.of("A-1")));
+        jdbc.update(
+                "update booking.seats set price_amount = 99_999 where seat_label = 'A-1'");
+        UUID paymentId = UUID.randomUUID();
+        org.mockito.Mockito.when(paymentGateway.charge(new ChargePayment(
+                        reservation.reservationId(),
+                        5_000,
+                        "EUR",
+                        "pm-snapshot",
+                        new PaymentSimulation(null, null))))
+                .thenReturn(new PaymentResult(
+                        paymentId,
+                        reservation.reservationId(),
+                        5_000,
+                        "EUR",
+                        fingerprint("pm-snapshot"),
+                        PaymentStatus.SUCCEEDED,
+                        null));
+
+        CheckoutResponse checkout = checkoutService.checkout(
+                new CheckoutRequest(reservation.reservationId(), "pm-snapshot"),
+                null,
+                null);
+
+        assertThat(reservation.amount()).isEqualTo(5_000);
+        assertThat(checkout.amount()).isEqualTo(5_000);
+        assertThat(checkout.status()).isEqualTo(ReservationStatus.BOOKED);
     }
 
     @Test

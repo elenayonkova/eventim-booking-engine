@@ -8,6 +8,7 @@ public record RefundRecord(
         UUID id,
         UUID reservationId,
         UUID paymentId,
-        RefundStatus status
+        RefundStatus status,
+        int attempt
 ) {
 }

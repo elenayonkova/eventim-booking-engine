@@ -8,8 +8,6 @@ public record ReservationSeatRow(
         UUID id,
         String seatLabel,
         SeatStatus status,
-        UUID currentReservationId,
-        long priceAmount,
-        String currency
+        UUID currentReservationId
 ) {
 }

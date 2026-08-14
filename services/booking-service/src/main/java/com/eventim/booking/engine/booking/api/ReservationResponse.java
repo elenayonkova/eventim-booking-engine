@@ -11,6 +11,8 @@ public record ReservationResponse(
         String eventId,
         List<String> seatIds,
         ReservationStatus status,
-        OffsetDateTime expiresAt
+        OffsetDateTime expiresAt,
+        long amount,
+        String currency
 ) {
 }

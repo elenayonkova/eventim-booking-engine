@@ -64,7 +64,9 @@ public class BookingService {
                 result.eventId(),
                 result.seatIds(),
                 ReservationStatus.HELD,
-                result.expiresAt());
+                result.expiresAt(),
+                result.amount(),
+                result.currency());
     }
 
 }

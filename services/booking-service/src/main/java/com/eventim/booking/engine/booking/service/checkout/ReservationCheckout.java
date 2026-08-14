@@ -20,8 +20,8 @@ import com.eventim.booking.engine.booking.service.ExternalServiceException;
 
 /**
  * Owns every local, transactional state transition in the checkout workflow.
- * External payment and refund calls are deliberately handled by {@link CheckoutService}
- * so that no database transaction is held while waiting for another service.
+ * External payment and refund calls are deliberately handled by
+ * {@link CheckoutService} so no database transaction is held during network I/O.
  */
 @Component
 public class ReservationCheckout {
@@ -36,51 +36,55 @@ public class ReservationCheckout {
     }
 
     @Transactional
-    public CheckoutStep beginCheckout(UUID reservationId, String paymentMethodFingerprint) {
+    public CheckoutSnapshot beginCheckout(UUID reservationId, String paymentMethodFingerprint) {
         ReservationRow reservation = bookingRepository.lockReservation(reservationId);
 
         switch (reservation.status()) {
             case HELD:
                 return beginHeldCheckout(reservation, paymentMethodFingerprint);
             case PAYMENT_PENDING:
-                ensureSameCheckoutPayload(reservation, paymentMethodFingerprint);
+                ensureSamePaymentMethod(reservation, paymentMethodFingerprint);
                 requireReservationOwnsSeats(reservation.id(), SeatStatus.HELD);
-                return CheckoutStep.charge(reservation);
+                return CheckoutSnapshot.from(reservation);
             case BOOKED:
             case PAYMENT_FAILED:
-            case REFUNDED:
-                ensureSameCheckoutPayload(reservation, paymentMethodFingerprint);
-                return CheckoutStep.terminal(reservation);
             case REFUND_REQUIRED:
-                ensureSameCheckoutPayload(reservation, paymentMethodFingerprint);
-                return CheckoutStep.refund(reservation);
+            case REFUNDED:
+                ensureSamePaymentMethod(reservation, paymentMethodFingerprint);
+                return CheckoutSnapshot.from(reservation);
             case EXPIRED:
-                return CheckoutStep.expired(reservation.id());
+                return CheckoutSnapshot.from(reservation);
             default:
                 throw new IllegalStateException("Unknown reservation state: " + reservation.status());
         }
     }
 
     @Transactional
-    public CheckoutStep loadPaymentPendingCheckout(UUID reservationId) {
+    public CheckoutSnapshot loadPaymentPendingCheckout(UUID reservationId) {
         ReservationRow reservation = bookingRepository.lockReservation(reservationId);
-        if (reservation.status() == ReservationStatus.PAYMENT_PENDING) {
-            return CheckoutStep.charge(reservation);
+        if (reservation.status() != ReservationStatus.PAYMENT_PENDING) {
+            return null;
         }
-        return null;
+        bookingRepository.touchReconciliationAttempt(
+                reservation.id(),
+                ReservationStatus.PAYMENT_PENDING);
+        return CheckoutSnapshot.from(reservation);
     }
 
     @Transactional
-    public CheckoutStep loadRefundRequiredCheckout(UUID reservationId) {
+    public CheckoutSnapshot loadRefundRequiredCheckout(UUID reservationId) {
         ReservationRow reservation = bookingRepository.lockReservation(reservationId);
-        if (reservation.status() == ReservationStatus.REFUND_REQUIRED) {
-            return CheckoutStep.refund(reservation);
+        if (reservation.status() != ReservationStatus.REFUND_REQUIRED) {
+            return null;
         }
-        return null;
+        bookingRepository.touchReconciliationAttempt(
+                reservation.id(),
+                ReservationStatus.REFUND_REQUIRED);
+        return CheckoutSnapshot.from(reservation);
     }
 
     @Transactional
-    public CheckoutStep loadTimedOutPaymentPendingCheckout(
+    public CheckoutSnapshot loadTimedOutPaymentPendingCheckout(
             UUID reservationId,
             Duration pendingTimeout
     ) {
@@ -88,18 +92,15 @@ public class ReservationCheckout {
         if (reservation.status() != ReservationStatus.PAYMENT_PENDING) {
             return null;
         }
-        if (reservation.checkoutStartedAt() == null) {
+        if (reservation.checkoutStartedAt().plus(pendingTimeout)
+                .isAfter(bookingRepository.databaseNow())) {
             return null;
         }
-        if (reservation.checkoutStartedAt().plus(pendingTimeout).isAfter(bookingRepository.databaseNow())) {
-            return null;
-        }
-
-        return CheckoutStep.charge(reservation);
+        return CheckoutSnapshot.from(reservation);
     }
 
     @Transactional
-    public void failPaymentAfterCancellation(CheckoutStep checkout) {
+    public void failPaymentAfterCancellation(CheckoutSnapshot checkout) {
         ReservationRow reservation = bookingRepository.lockReservation(checkout.reservationId());
         ensureStoredCheckout(reservation, checkout);
         if (reservation.status().hasCheckoutResponse()) {
@@ -117,7 +118,7 @@ public class ReservationCheckout {
     }
 
     @Transactional
-    public CheckoutStep applyPaymentResult(CheckoutStep checkout, PaymentResult payment) {
+    public CheckoutSnapshot applyPaymentResult(CheckoutSnapshot checkout, PaymentResult payment) {
         validatePaymentReservation(checkout, payment);
 
         ReservationRow reservation = bookingRepository.lockReservation(checkout.reservationId());
@@ -149,78 +150,80 @@ public class ReservationCheckout {
     }
 
     @Transactional
-    public CheckoutStep markRefunded(CheckoutStep checkout, RefundResult refund) {
+    public CheckoutSnapshot markRefunded(CheckoutSnapshot checkout, RefundResult refund) {
         ReservationRow reservation = bookingRepository.lockReservation(checkout.reservationId());
         validateRefund(checkout, reservation, refund);
         if (reservation.status() == ReservationStatus.REFUNDED) {
-            return CheckoutStep.terminal(reservation);
+            return CheckoutSnapshot.from(reservation);
         }
-        if (reservation.status() == ReservationStatus.REFUND_REQUIRED) {
-            bookingRepository.markRefundedAndReleaseSeats(reservation.id());
-            return CheckoutStep.refunded(reservation, refund.paymentId());
+        if (reservation.status() != ReservationStatus.REFUND_REQUIRED) {
+            throw new ConflictException(
+                    "Refund cannot be applied from state " + reservation.status());
         }
 
-        throw new ConflictException(
-                "Refund cannot be applied from state " + reservation.status());
+        bookingRepository.markRefundedAndReleaseSeats(reservation.id());
+        return checkout.withPaymentResult(
+                refund.paymentId(),
+                ReservationStatus.REFUNDED,
+                reservation.paymentFailureReason());
     }
 
-    private CheckoutStep beginHeldCheckout(
+    private CheckoutSnapshot beginHeldCheckout(
             ReservationRow reservation,
             String paymentMethodFingerprint
     ) {
         if (!reservation.expiresAt().isAfter(bookingRepository.databaseNow())) {
             bookingRepository.expireHeldReservation(reservation.id());
-            return CheckoutStep.expired(reservation.id());
+            return snapshot(
+                    reservation,
+                    null,
+                    ReservationStatus.EXPIRED,
+                    null,
+                    "Reservation expired");
         }
 
-        List<ReservationSeatRow> seats = requireReservationOwnsSeats(
-                reservation.id(),
-                SeatStatus.HELD);
-        Pricing pricing = calculatePricing(seats);
-        bookingRepository.markPaymentPending(
-                reservation.id(),
-                pricing.amount(),
-                pricing.currency(),
-                paymentMethodFingerprint);
-
-        return CheckoutStep.startedCharge(
-                reservation.id(),
-                pricing.amount(),
-                pricing.currency(),
-                paymentMethodFingerprint);
+        requireReservationOwnsSeats(reservation.id(), SeatStatus.HELD);
+        bookingRepository.markPaymentPending(reservation.id(), paymentMethodFingerprint);
+        return snapshot(
+                reservation,
+                null,
+                ReservationStatus.PAYMENT_PENDING,
+                paymentMethodFingerprint,
+                null);
     }
 
-    private CheckoutStep applyProcessingPayment(
+    private CheckoutSnapshot applyProcessingPayment(
             ReservationRow reservation,
-            CheckoutStep checkout,
+            CheckoutSnapshot checkout,
             PaymentResult payment
     ) {
         if (reservation.status() == ReservationStatus.PAYMENT_PENDING) {
             bookingRepository.recordProcessingPayment(reservation.id(), payment.paymentId());
-            return checkout.asResponse(payment.paymentId(), ReservationStatus.PAYMENT_PENDING, null);
+            return checkout.withPaymentResult(
+                    payment.paymentId(),
+                    ReservationStatus.PAYMENT_PENDING,
+                    null);
         }
         if (reservation.status() == ReservationStatus.REFUND_REQUIRED) {
-            return CheckoutStep.refund(reservation);
+            return CheckoutSnapshot.from(reservation);
         }
         if (reservation.status().hasCheckoutResponse()) {
-            return CheckoutStep.terminal(reservation);
+            return CheckoutSnapshot.from(reservation);
         }
 
         throw new ConflictException(
                 "Processing payment cannot be applied from state " + reservation.status());
     }
 
-    private CheckoutStep applySuccessfulPayment(
+    private CheckoutSnapshot applySuccessfulPayment(
             ReservationRow reservation,
-            CheckoutStep checkout,
+            CheckoutSnapshot checkout,
             PaymentResult payment
     ) {
         if (reservation.status() == ReservationStatus.BOOKED
-                || reservation.status() == ReservationStatus.REFUNDED) {
-            return CheckoutStep.terminal(reservation);
-        }
-        if (reservation.status() == ReservationStatus.REFUND_REQUIRED) {
-            return CheckoutStep.refund(reservation);
+                || reservation.status() == ReservationStatus.REFUNDED
+                || reservation.status() == ReservationStatus.REFUND_REQUIRED) {
+            return CheckoutSnapshot.from(reservation);
         }
         if (reservation.status() != ReservationStatus.PAYMENT_PENDING) {
             throw new ConflictException(
@@ -233,83 +236,85 @@ public class ReservationCheckout {
                     reservation.id(),
                     payment.paymentId(),
                     "Paid reservation no longer owns every held seat");
-            return checkout.asRefundRequired(
+            return checkout.withPaymentResult(
                     payment.paymentId(),
+                    ReservationStatus.REFUND_REQUIRED,
                     "Booking could not be finalized; refund required");
         }
 
         bookingRepository.bookSeatsAndMarkBooked(reservation.id(), payment.paymentId());
-        return checkout.asResponse(payment.paymentId(), ReservationStatus.BOOKED, null);
+        return checkout.withPaymentResult(payment.paymentId(), ReservationStatus.BOOKED, null);
     }
 
-    private CheckoutStep applyFailedPayment(
+    private CheckoutSnapshot applyFailedPayment(
             ReservationRow reservation,
-            CheckoutStep checkout,
+            CheckoutSnapshot checkout,
             PaymentResult payment,
             String failureReason
     ) {
         if (reservation.status().hasCheckoutResponse()) {
-            return CheckoutStep.terminal(reservation);
+            return CheckoutSnapshot.from(reservation);
         }
-        if (reservation.status() == ReservationStatus.PAYMENT_PENDING) {
-            bookingRepository.markPaymentFailedAndReleaseSeats(
-                    reservation.id(),
-                    payment.paymentId(),
-                    failureReason);
-            return checkout.asResponse(
-                    payment.paymentId(),
-                    ReservationStatus.PAYMENT_FAILED,
-                    failureReason);
+        if (reservation.status() != ReservationStatus.PAYMENT_PENDING) {
+            throw new ConflictException(
+                    "Payment failure cannot be applied from state " + reservation.status());
         }
 
-        throw new ConflictException(
-                "Payment failure cannot be applied from state " + reservation.status());
+        bookingRepository.markPaymentFailedAndReleaseSeats(
+                reservation.id(),
+                payment.paymentId(),
+                failureReason);
+        return checkout.withPaymentResult(
+                payment.paymentId(),
+                ReservationStatus.PAYMENT_FAILED,
+                failureReason);
     }
 
-    private CheckoutStep applyAlreadyRefundedPayment(
+    private CheckoutSnapshot applyAlreadyRefundedPayment(
             ReservationRow reservation,
-            CheckoutStep checkout,
+            CheckoutSnapshot checkout,
             PaymentResult payment
     ) {
         if (reservation.status() == ReservationStatus.REFUNDED) {
-            return CheckoutStep.terminal(reservation);
+            return CheckoutSnapshot.from(reservation);
         }
-        if (reservation.status() == ReservationStatus.PAYMENT_PENDING) {
-            String reason = "Payment was already refunded before booking completed";
-            bookingRepository.markRefundRequiredAndReleaseSeats(
-                    reservation.id(),
-                    payment.paymentId(),
-                    reason);
-            bookingRepository.markRefunded(reservation.id());
-            return checkout.asResponse(payment.paymentId(), ReservationStatus.REFUNDED, reason);
+        if (reservation.status() != ReservationStatus.PAYMENT_PENDING) {
+            throw new ConflictException(
+                    "Refunded payment cannot be applied from state " + reservation.status());
         }
 
-        throw new ConflictException(
-                "Refunded payment cannot be applied from state " + reservation.status());
+        String reason = "Payment was already refunded before booking completed";
+        bookingRepository.markRefundRequiredAndReleaseSeats(
+                reservation.id(),
+                payment.paymentId(),
+                reason);
+        bookingRepository.markRefunded(reservation.id());
+        return checkout.withPaymentResult(payment.paymentId(), ReservationStatus.REFUNDED, reason);
     }
 
-    private CheckoutStep applyMismatchedPaymentForRefund(
+    private CheckoutSnapshot applyMismatchedPaymentForRefund(
             ReservationRow reservation,
-            CheckoutStep checkout,
+            CheckoutSnapshot checkout,
             PaymentResult payment,
             String reason
     ) {
-        if (reservation.status() == ReservationStatus.REFUNDED) {
-            return CheckoutStep.terminal(reservation);
+        if (reservation.status() == ReservationStatus.REFUNDED
+                || reservation.status() == ReservationStatus.REFUND_REQUIRED) {
+            return CheckoutSnapshot.from(reservation);
         }
-        if (reservation.status() == ReservationStatus.REFUND_REQUIRED) {
-            return CheckoutStep.refund(reservation);
-        }
-        if (reservation.status() == ReservationStatus.PAYMENT_PENDING) {
-            bookingRepository.markRefundRequiredAndReleaseSeats(
-                    reservation.id(),
-                    payment.paymentId(),
-                    reason);
-            return checkout.asRefundRequired(payment.paymentId(), reason);
+        if (reservation.status() != ReservationStatus.PAYMENT_PENDING) {
+            throw new ConflictException(
+                    "Mismatched payment cannot be refunded from state " + reservation.status());
         }
 
-        throw new ConflictException(
-                "Mismatched payment cannot be refunded from state " + reservation.status());
+        bookingRepository.markRefundRequiredAndReleaseSeats(
+                reservation.id(),
+                payment.paymentId(),
+                reason);
+        return checkout.withPaymentResult(
+                payment.paymentId(),
+                ReservationStatus.REFUND_REQUIRED,
+                reason);
     }
 
     private List<ReservationSeatRow> requireReservationOwnsSeats(
@@ -334,66 +339,51 @@ public class ReservationCheckout {
         }
 
         for (ReservationSeatRow seat : seats) {
-            if (seat.status() != requiredStatus) {
-                return false;
-            }
-            if (!reservationId.equals(seat.currentReservationId())) {
+            if (seat.status() != requiredStatus
+                    || !reservationId.equals(seat.currentReservationId())) {
                 return false;
             }
         }
         return true;
     }
 
-    private Pricing calculatePricing(List<ReservationSeatRow> seats) {
-        String currency = seats.get(0).currency();
-        long amount = 0L;
-        for (ReservationSeatRow seat : seats) {
-            if (!currency.equals(seat.currency())) {
-                throw new ConflictException(
-                        "A reservation cannot contain seats in different currencies");
-            }
-            amount = Math.addExact(amount, seat.priceAmount());
-        }
-        return new Pricing(amount, currency);
-    }
-
-    private void ensureSameCheckoutPayload(
+    private void ensureSamePaymentMethod(
             ReservationRow reservation,
             String paymentMethodFingerprint
     ) {
-        if (reservation.checkoutAmount() == null
-                || reservation.checkoutCurrency() == null
-                || reservation.paymentMethodFingerprint() == null) {
-            throw new ConflictException(
-                    "Reservation has incomplete checkout state: " + reservation.id());
-        }
         if (!reservation.paymentMethodFingerprint().equals(paymentMethodFingerprint)) {
             throw new ConflictException(
                     "Checkout already exists for reservation with different payment details");
         }
     }
 
-    private void ensureStoredCheckout(ReservationRow reservation, CheckoutStep checkout) {
-        if (reservation.checkoutAmount() == null
-                || reservation.paymentMethodFingerprint() == null
-                || reservation.checkoutAmount() != checkout.amount()
-                || !Objects.equals(reservation.checkoutCurrency(), checkout.currency())
-                || !Objects.equals(
-                        reservation.paymentMethodFingerprint(),
+    private void ensureStoredCheckout(
+            ReservationRow reservation,
+            CheckoutSnapshot checkout
+    ) {
+        if (reservation.checkoutAmount() != checkout.amount()
+                || !reservation.checkoutCurrency().equals(checkout.currency())
+                || !reservation.paymentMethodFingerprint().equals(
                         checkout.paymentMethodFingerprint())) {
             throw new ConflictException("Reservation checkout price changed unexpectedly");
         }
     }
 
-    private void validatePaymentReservation(CheckoutStep checkout, PaymentResult payment) {
-        if (!payment.reservationId().equals(checkout.reservationId())) {
+    private void validatePaymentReservation(CheckoutSnapshot checkout, PaymentResult payment) {
+        if (payment.paymentId() == null
+                || payment.reservationId() == null
+                || payment.status() == null) {
+            throw new ExternalServiceException(
+                    "Payment service returned an incomplete payment result");
+        }
+        if (!checkout.reservationId().equals(payment.reservationId())) {
             throw new ExternalServiceException(
                     "Payment service returned a result for another reservation");
         }
     }
 
     private void validateRefund(
-            CheckoutStep checkout,
+            CheckoutSnapshot checkout,
             ReservationRow reservation,
             RefundResult refund
     ) {
@@ -415,15 +405,28 @@ public class ReservationCheckout {
         }
     }
 
-    private boolean paymentMatchesCheckout(CheckoutStep checkout, PaymentResult payment) {
+    private boolean paymentMatchesCheckout(CheckoutSnapshot checkout, PaymentResult payment) {
         return payment.amount() == checkout.amount()
-                && payment.currency() != null
-                && payment.currency().equalsIgnoreCase(checkout.currency())
+                && checkout.currency().equalsIgnoreCase(payment.currency())
                 && Objects.equals(
                         payment.paymentMethodFingerprint(),
                         checkout.paymentMethodFingerprint());
     }
 
-    private record Pricing(long amount, String currency) {
+    private CheckoutSnapshot snapshot(
+            ReservationRow reservation,
+            UUID paymentId,
+            ReservationStatus status,
+            String paymentMethodFingerprint,
+            String failureReason
+    ) {
+        return new CheckoutSnapshot(
+                reservation.id(),
+                paymentId,
+                status,
+                reservation.checkoutAmount(),
+                reservation.checkoutCurrency(),
+                paymentMethodFingerprint,
+                failureReason);
     }
 }

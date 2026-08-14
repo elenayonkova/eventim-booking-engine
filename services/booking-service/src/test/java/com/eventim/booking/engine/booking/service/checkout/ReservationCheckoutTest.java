@@ -3,9 +3,6 @@ package com.eventim.booking.engine.booking.service.checkout;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.ArgumentMatchers.anyLong;
-import static org.mockito.ArgumentMatchers.anyString;
-import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.verifyNoMoreInteractions;
@@ -29,7 +26,6 @@ import com.eventim.booking.engine.booking.payment.PaymentStatus;
 import com.eventim.booking.engine.booking.repository.BookingRepository;
 import com.eventim.booking.engine.booking.repository.ReservationRow;
 import com.eventim.booking.engine.booking.repository.ReservationSeatRow;
-import com.eventim.booking.engine.booking.service.ConflictException;
 import com.eventim.booking.engine.booking.service.ExternalServiceException;
 
 @ExtendWith(MockitoExtension.class)
@@ -50,22 +46,24 @@ class ReservationCheckoutTest {
     }
 
     @Test
-    void checkoutWithSeatsInDifferentCurrenciesIsRejectedBeforePaymentStateIsStored() {
+    void heldCheckoutUsesTheReservationPriceSnapshot() {
         UUID reservationId = UUID.randomUUID();
         OffsetDateTime now = OffsetDateTime.now();
         ReservationRow reservation = heldReservation(reservationId, now.plusMinutes(5));
         when(bookingRepository.lockReservation(reservationId)).thenReturn(reservation);
         when(bookingRepository.databaseNow()).thenReturn(now);
         when(bookingRepository.lockReservationSeats(reservationId)).thenReturn(List.of(
-                heldSeat("A-1", reservationId, 5_000, "EUR"),
-                heldSeat("A-2", reservationId, 6_000, "USD")));
+                heldSeat("A-1", reservationId),
+                heldSeat("A-2", reservationId)));
 
-        assertThatThrownBy(() -> reservationCheckout.beginCheckout(reservationId, FINGERPRINT))
-                .isInstanceOf(ConflictException.class)
-                .hasMessageContaining("different currencies");
+        CheckoutSnapshot checkout = reservationCheckout.beginCheckout(
+                reservationId,
+                FINGERPRINT);
 
-        verify(bookingRepository, never()).markPaymentPending(
-                any(), anyLong(), anyString(), anyString());
+        assertThat(checkout.amount()).isEqualTo(AMOUNT);
+        assertThat(checkout.currency()).isEqualTo(CURRENCY);
+        assertThat(checkout.status()).isEqualTo(ReservationStatus.PAYMENT_PENDING);
+        verify(bookingRepository).markPaymentPending(reservationId, FINGERPRINT);
     }
 
     @Test
@@ -77,25 +75,19 @@ class ReservationCheckoutTest {
                 paymentId,
                 ReservationStatus.PAYMENT_PENDING,
                 OffsetDateTime.now());
-        CheckoutStep checkout = CheckoutStep.charge(reservation);
-        PaymentResult payment = payment(
-                paymentId,
-                reservationId,
-                PaymentStatus.SUCCEEDED);
+        CheckoutSnapshot checkout = CheckoutSnapshot.from(reservation);
+        PaymentResult payment = payment(paymentId, reservationId, PaymentStatus.SUCCEEDED);
         when(bookingRepository.lockReservation(reservationId)).thenReturn(reservation);
         when(bookingRepository.lockReservationSeats(reservationId)).thenReturn(List.of(
                 new ReservationSeatRow(
                         UUID.randomUUID(),
                         "A-1",
                         SeatStatus.AVAILABLE,
-                        null,
-                        AMOUNT,
-                        CURRENCY)));
+                        null)));
 
-        CheckoutStep result = reservationCheckout.applyPaymentResult(checkout, payment);
+        CheckoutSnapshot result = reservationCheckout.applyPaymentResult(checkout, payment);
 
-        assertThat(result.action()).isEqualTo(CheckoutStep.Action.REFUND);
-        assertThat(result.reservationStatus()).isEqualTo(ReservationStatus.REFUND_REQUIRED);
+        assertThat(result.status()).isEqualTo(ReservationStatus.REFUND_REQUIRED);
         assertThat(result.paymentId()).isEqualTo(paymentId);
         verify(bookingRepository).markRefundRequiredAndReleaseSeats(
                 reservationId,
@@ -106,11 +98,7 @@ class ReservationCheckoutTest {
     @Test
     void paymentForDifferentReservationIsRejectedBeforeStoredStateIsRead() {
         UUID reservationId = UUID.randomUUID();
-        CheckoutStep checkout = CheckoutStep.startedCharge(
-                reservationId,
-                AMOUNT,
-                CURRENCY,
-                FINGERPRINT);
+        CheckoutSnapshot checkout = pendingCheckout(reservationId);
         PaymentResult payment = payment(
                 UUID.randomUUID(),
                 UUID.randomUUID(),
@@ -127,11 +115,7 @@ class ReservationCheckoutTest {
     void processingResultAfterReservationBecameBookedReturnsStoredTerminalState() {
         UUID reservationId = UUID.randomUUID();
         UUID paymentId = UUID.randomUUID();
-        CheckoutStep checkout = CheckoutStep.startedCharge(
-                reservationId,
-                AMOUNT,
-                CURRENCY,
-                FINGERPRINT);
+        CheckoutSnapshot checkout = pendingCheckout(reservationId);
         ReservationRow booked = checkoutReservation(
                 reservationId,
                 paymentId,
@@ -139,14 +123,34 @@ class ReservationCheckoutTest {
                 OffsetDateTime.now());
         when(bookingRepository.lockReservation(reservationId)).thenReturn(booked);
 
-        CheckoutStep result = reservationCheckout.applyPaymentResult(
+        CheckoutSnapshot result = reservationCheckout.applyPaymentResult(
                 checkout,
                 payment(paymentId, reservationId, PaymentStatus.PROCESSING));
 
-        assertThat(result.action()).isEqualTo(CheckoutStep.Action.RETURN);
-        assertThat(result.reservationStatus()).isEqualTo(ReservationStatus.BOOKED);
+        assertThat(result.status()).isEqualTo(ReservationStatus.BOOKED);
         verify(bookingRepository).lockReservation(reservationId);
         verifyNoMoreInteractions(bookingRepository);
+    }
+
+    @Test
+    void processingPaymentRemainsPending() {
+        UUID reservationId = UUID.randomUUID();
+        UUID paymentId = UUID.randomUUID();
+        CheckoutSnapshot checkout = pendingCheckout(reservationId);
+        ReservationRow pending = checkoutReservation(
+                reservationId,
+                null,
+                ReservationStatus.PAYMENT_PENDING,
+                OffsetDateTime.now());
+        when(bookingRepository.lockReservation(reservationId)).thenReturn(pending);
+
+        CheckoutSnapshot result = reservationCheckout.applyPaymentResult(
+                checkout,
+                payment(paymentId, reservationId, PaymentStatus.PROCESSING));
+
+        assertThat(result.status()).isEqualTo(ReservationStatus.PAYMENT_PENDING);
+        assertThat(result.paymentId()).isEqualTo(paymentId);
+        verify(bookingRepository).recordProcessingPayment(reservationId, paymentId);
     }
 
     @Test
@@ -162,12 +166,12 @@ class ReservationCheckoutTest {
         when(bookingRepository.lockReservation(reservationId)).thenReturn(reservation);
         when(bookingRepository.databaseNow()).thenReturn(checkoutStartedAt.plus(timeout));
 
-        CheckoutStep result = reservationCheckout.loadTimedOutPaymentPendingCheckout(
+        CheckoutSnapshot result = reservationCheckout.loadTimedOutPaymentPendingCheckout(
                 reservationId,
                 timeout);
 
         assertThat(result).isNotNull();
-        assertThat(result.action()).isEqualTo(CheckoutStep.Action.CHARGE);
+        assertThat(result.status()).isEqualTo(ReservationStatus.PAYMENT_PENDING);
     }
 
     private ReservationRow heldReservation(UUID reservationId, OffsetDateTime expiresAt) {
@@ -177,8 +181,8 @@ class ReservationCheckoutTest {
                 ReservationStatus.HELD,
                 expiresAt,
                 null,
-                null,
-                null,
+                AMOUNT,
+                CURRENCY,
                 null,
                 null,
                 null);
@@ -203,19 +207,23 @@ class ReservationCheckoutTest {
                 null);
     }
 
-    private ReservationSeatRow heldSeat(
-            String label,
-            UUID reservationId,
-            long amount,
-            String currency
-    ) {
+    private CheckoutSnapshot pendingCheckout(UUID reservationId) {
+        return new CheckoutSnapshot(
+                reservationId,
+                null,
+                ReservationStatus.PAYMENT_PENDING,
+                AMOUNT,
+                CURRENCY,
+                FINGERPRINT,
+                null);
+    }
+
+    private ReservationSeatRow heldSeat(String label, UUID reservationId) {
         return new ReservationSeatRow(
                 UUID.randomUUID(),
                 label,
                 SeatStatus.HELD,
-                reservationId,
-                amount,
-                currency);
+                reservationId);
     }
 
     private PaymentResult payment(UUID paymentId, UUID reservationId, PaymentStatus status) {
