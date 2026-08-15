@@ -6,6 +6,7 @@ import org.springframework.validation.FieldError;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
+import org.springframework.web.method.annotation.HandlerMethodValidationException;
 
 import com.eventim.booking.engine.booking.service.ConflictException;
 import com.eventim.booking.engine.booking.service.ExternalServiceException;
@@ -33,6 +34,17 @@ public class ApiExceptionHandler {
     @ExceptionHandler(MethodArgumentNotValidException.class)
     public ResponseEntity<ErrorResponse> validation(MethodArgumentNotValidException exception) {
         String message = validationMessage(exception);
+        return ResponseEntity.badRequest()
+                .body(ErrorResponse.of(400, "Bad Request", message));
+    }
+
+    @ExceptionHandler(HandlerMethodValidationException.class)
+    public ResponseEntity<ErrorResponse> methodValidation(
+            HandlerMethodValidationException exception
+    ) {
+        String message = exception.getAllErrors().stream()
+                .map(error -> error.getDefaultMessage())
+                .collect(java.util.stream.Collectors.joining("; "));
         return ResponseEntity.badRequest()
                 .body(ErrorResponse.of(400, "Bad Request", message));
     }

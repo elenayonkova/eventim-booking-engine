@@ -6,9 +6,9 @@ import jakarta.validation.Valid;
 import jakarta.validation.constraints.Max;
 import jakarta.validation.constraints.Min;
 
+import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
-import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -17,8 +17,8 @@ import org.springframework.web.bind.annotation.RestController;
 import com.eventim.booking.engine.payment.service.PaymentService;
 
 /**
- * Exposes payment creation, lookup, cancellation, and refund endpoints. Request
- * validation is handled at the HTTP boundary and processing is delegated to
+ * Exposes the required payment and refund endpoints. Request validation is
+ * handled at the HTTP boundary and processing is delegated to
  * {@link PaymentService}.
  */
 @RestController
@@ -41,28 +41,19 @@ public class PaymentController {
         return paymentService.createPayment(request, delayMs, simulateFailure);
     }
 
-    @PostMapping("/payments/cancellations")
-    public PaymentCancellationResponse cancelPayment(
-            @Valid @RequestBody PaymentCancellationRequest request,
-            @RequestHeader(name = "X-Simulate-Delay-Ms", required = false)
-            @Min(0) @Max(MAX_SIMULATED_DELAY_MS) Long delayMs,
-            @RequestHeader(name = "X-Simulate-Failure", required = false) String simulateFailure
-    ) {
-        return paymentService.cancelPayment(request, delayMs, simulateFailure);
+    @GetMapping("/payments/{reservationId}")
+    public PaymentResponse getPayment(@PathVariable java.util.UUID reservationId) {
+        return paymentService.getPayment(reservationId);
     }
 
     @PostMapping("/refunds")
-    public RefundResponse refund(
+    public RefundResponse createRefund(
             @Valid @RequestBody RefundRequest request,
             @RequestHeader(name = "X-Simulate-Delay-Ms", required = false)
             @Min(0) @Max(MAX_SIMULATED_DELAY_MS) Long delayMs,
             @RequestHeader(name = "X-Simulate-Failure", required = false) String simulateFailure
     ) {
-        return paymentService.refund(request, delayMs, simulateFailure);
+        return paymentService.createRefund(request, delayMs, simulateFailure);
     }
 
-    @GetMapping("/payments/by-reservation/{reservationId}")
-    public PaymentResponse getPayment(@PathVariable java.util.UUID reservationId) {
-        return paymentService.getPayment(reservationId);
-    }
 }

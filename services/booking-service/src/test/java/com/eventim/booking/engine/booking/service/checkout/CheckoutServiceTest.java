@@ -9,8 +9,8 @@ import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
-import java.time.Duration;
 import java.time.OffsetDateTime;
+import java.time.Duration;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
@@ -22,9 +22,8 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
 import com.eventim.booking.engine.booking.api.CheckoutRequest;
-import com.eventim.booking.engine.booking.config.BookingProperties;
 import com.eventim.booking.engine.booking.domain.ReservationStatus;
-import com.eventim.booking.engine.booking.payment.PaymentCancellationResult;
+import com.eventim.booking.engine.booking.config.BookingProperties;
 import com.eventim.booking.engine.booking.payment.PaymentGateway;
 import com.eventim.booking.engine.booking.payment.PaymentResult;
 import com.eventim.booking.engine.booking.payment.PaymentStatus;
@@ -39,13 +38,10 @@ class CheckoutServiceTest {
 
     private static final long AMOUNT = 5_000;
     private static final String CURRENCY = "EUR";
-    private static final String FINGERPRINT = "fingerprint";
+    private static final String TOKEN_DIGEST = "token-digest";
 
     @Mock
     BookingRepository bookingRepository;
-
-    @Mock
-    BookingProperties bookingProperties;
 
     @Mock
     PaymentGateway paymentGateway;
@@ -53,15 +49,18 @@ class CheckoutServiceTest {
     @Mock
     ReservationCheckout reservationCheckout;
 
+    @Mock
+    BookingProperties bookingProperties;
+
     CheckoutService checkoutService;
 
     @BeforeEach
     void setUp() {
         checkoutService = new CheckoutService(
                 bookingRepository,
-                bookingProperties,
                 paymentGateway,
-                reservationCheckout);
+                reservationCheckout,
+                bookingProperties);
     }
 
     @Test
@@ -75,83 +74,19 @@ class CheckoutServiceTest {
                 paymentId,
                 ReservationStatus.PAYMENT_PENDING,
                 null);
-        when(reservationCheckout.beginCheckout(eq(reservationId), anyString()))
+        when(reservationCheckout.beginCheckout(
+                eq(reservationId),
+                anyString()))
                 .thenReturn(pending);
         when(paymentGateway.charge(any())).thenReturn(processing);
         when(reservationCheckout.applyPaymentResult(pending, processing)).thenReturn(stored);
 
-        var response = checkoutService.checkout(request, null, null);
+        var response = checkoutService.completeCheckout(request, null, null);
 
         assertThat(response.status()).isEqualTo(ReservationStatus.PAYMENT_PENDING);
         assertThat(response.paymentId()).isEqualTo(paymentId);
         verify(paymentGateway).charge(any());
         verify(paymentGateway, never()).refund(any());
-    }
-
-    @Test
-    void missingPaymentBeforeTimeoutIsLeftPendingWithoutCancellation() {
-        UUID reservationId = UUID.randomUUID();
-        Duration timeout = Duration.ofMinutes(3);
-        CheckoutSnapshot checkout = pendingCheckout(reservationId);
-        when(bookingRepository.findPaymentPendingReservationIds()).thenReturn(List.of(reservationId));
-        when(bookingRepository.findRefundRequiredReservationIds()).thenReturn(List.of());
-        when(reservationCheckout.loadPaymentPendingCheckout(reservationId)).thenReturn(checkout);
-        when(paymentGateway.find(reservationId)).thenReturn(Optional.empty());
-        when(bookingProperties.paymentPendingTimeout()).thenReturn(timeout);
-        when(reservationCheckout.loadTimedOutPaymentPendingCheckout(reservationId, timeout))
-                .thenReturn(null);
-
-        checkoutService.reconcilePendingPayments();
-
-        verify(paymentGateway, never()).cancel(any());
-        verify(reservationCheckout, never()).failPaymentAfterCancellation(any());
-    }
-
-    @Test
-    void cancellationForAnotherReservationDoesNotFailThePendingCheckout() {
-        UUID reservationId = UUID.randomUUID();
-        Duration timeout = Duration.ofMinutes(3);
-        CheckoutSnapshot checkout = pendingCheckout(reservationId);
-        when(bookingRepository.findPaymentPendingReservationIds()).thenReturn(List.of(reservationId));
-        when(bookingRepository.findRefundRequiredReservationIds()).thenReturn(List.of());
-        when(reservationCheckout.loadPaymentPendingCheckout(reservationId)).thenReturn(checkout);
-        when(paymentGateway.find(reservationId)).thenReturn(Optional.empty());
-        when(bookingProperties.paymentPendingTimeout()).thenReturn(timeout);
-        when(reservationCheckout.loadTimedOutPaymentPendingCheckout(reservationId, timeout))
-                .thenReturn(checkout);
-        when(paymentGateway.cancel(reservationId)).thenReturn(
-                new PaymentCancellationResult(UUID.randomUUID(), null));
-
-        checkoutService.reconcilePendingPayments();
-
-        verify(reservationCheckout, never()).failPaymentAfterCancellation(any());
-        verify(reservationCheckout, never()).applyPaymentResult(any(), any());
-    }
-
-    @Test
-    void reconciliationContinuesAfterOneReservationFails() {
-        UUID failingReservationId = UUID.randomUUID();
-        UUID succeedingReservationId = UUID.randomUUID();
-        UUID paymentId = UUID.randomUUID();
-        CheckoutSnapshot pending = pendingCheckout(succeedingReservationId);
-        PaymentResult succeeded = payment(paymentId, succeedingReservationId, PaymentStatus.SUCCEEDED);
-        CheckoutSnapshot completed = pending.withPaymentResult(
-                paymentId,
-                ReservationStatus.BOOKED,
-                null);
-        when(bookingRepository.findPaymentPendingReservationIds())
-                .thenReturn(List.of(failingReservationId, succeedingReservationId));
-        when(bookingRepository.findRefundRequiredReservationIds()).thenReturn(List.of());
-        when(reservationCheckout.loadPaymentPendingCheckout(failingReservationId))
-                .thenThrow(new ExternalServiceException("temporary failure"));
-        when(reservationCheckout.loadPaymentPendingCheckout(succeedingReservationId))
-                .thenReturn(pending);
-        when(paymentGateway.find(succeedingReservationId)).thenReturn(Optional.of(succeeded));
-        when(reservationCheckout.applyPaymentResult(pending, succeeded)).thenReturn(completed);
-
-        checkoutService.reconcilePendingPayments();
-
-        verify(reservationCheckout).applyPaymentResult(pending, succeeded);
     }
 
     @Test
@@ -167,10 +102,11 @@ class CheckoutServiceTest {
                 paymentId,
                 AMOUNT,
                 CURRENCY,
-                FINGERPRINT,
-                OffsetDateTime.now(),
+                TOKEN_DIGEST,
                 "refund required"));
-        when(reservationCheckout.beginCheckout(eq(reservationId), anyString()))
+        when(reservationCheckout.beginCheckout(
+                eq(reservationId),
+                anyString()))
                 .thenReturn(refundRequired);
         when(paymentGateway.refund(reservationId)).thenReturn(new RefundResult(
                 refundId,
@@ -178,7 +114,7 @@ class CheckoutServiceTest {
                 paymentId,
                 RefundStatus.PROCESSING));
 
-        assertThatThrownBy(() -> checkoutService.checkout(
+        assertThatThrownBy(() -> checkoutService.completeCheckout(
                 new CheckoutRequest(reservationId, "pm-test"),
                 null,
                 null))
@@ -188,6 +124,46 @@ class CheckoutServiceTest {
         verify(reservationCheckout, never()).markRefunded(any(), any());
     }
 
+    @Test
+    void missingPaymentExpiresThePendingReservation() {
+        UUID reservationId = UUID.randomUUID();
+        CheckoutSnapshot pending = pendingCheckout(reservationId);
+        Duration timeout = Duration.ofSeconds(90);
+        when(bookingProperties.paymentMissingTimeout()).thenReturn(timeout);
+        when(bookingRepository.findPaymentPendingReservationIds(timeout))
+                .thenReturn(List.of(reservationId));
+        when(reservationCheckout.loadPaymentPendingCheckout(reservationId)).thenReturn(pending);
+        when(paymentGateway.findPayment(reservationId)).thenReturn(Optional.empty());
+
+        checkoutService.reconcilePendingPayments();
+
+        verify(reservationCheckout).expireMissingPayment(pending);
+    }
+
+    @Test
+    void durablePaymentResultIsAppliedByReconciliation() {
+        UUID reservationId = UUID.randomUUID();
+        UUID paymentId = UUID.randomUUID();
+        CheckoutSnapshot pending = pendingCheckout(reservationId);
+        PaymentResult succeeded = payment(paymentId, reservationId, PaymentStatus.SUCCEEDED);
+        Duration timeout = Duration.ofSeconds(90);
+        when(bookingProperties.paymentMissingTimeout()).thenReturn(timeout);
+        when(bookingRepository.findPaymentPendingReservationIds(timeout))
+                .thenReturn(List.of(reservationId));
+        when(reservationCheckout.loadPaymentPendingCheckout(reservationId)).thenReturn(pending);
+        when(paymentGateway.findPayment(reservationId)).thenReturn(Optional.of(succeeded));
+        when(reservationCheckout.applyPaymentResult(pending, succeeded))
+                .thenReturn(pending.withPaymentResult(
+                        paymentId,
+                        ReservationStatus.BOOKED,
+                        null));
+
+        checkoutService.reconcilePendingPayments();
+
+        verify(reservationCheckout).applyPaymentResult(pending, succeeded);
+        verify(reservationCheckout, never()).expireMissingPayment(any());
+    }
+
     private CheckoutSnapshot pendingCheckout(UUID reservationId) {
         return new CheckoutSnapshot(
                 reservationId,
@@ -195,7 +171,7 @@ class CheckoutServiceTest {
                 ReservationStatus.PAYMENT_PENDING,
                 AMOUNT,
                 CURRENCY,
-                FINGERPRINT,
+                TOKEN_DIGEST,
                 null);
     }
 
@@ -205,7 +181,7 @@ class CheckoutServiceTest {
                 reservationId,
                 AMOUNT,
                 CURRENCY,
-                FINGERPRINT,
+                TOKEN_DIGEST,
                 status,
                 null);
     }

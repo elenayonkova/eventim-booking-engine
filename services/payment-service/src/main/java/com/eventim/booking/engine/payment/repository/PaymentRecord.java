@@ -7,13 +7,12 @@ import com.eventim.booking.engine.payment.domain.PaymentStatus;
 public record PaymentRecord(
         UUID id,
         UUID reservationId,
-        Long amount,
+        long amount,
         String currency,
-        String paymentMethodFingerprint,
+        String paymentMethodToken,
+        String paymentMethodTokenDigest,
         PaymentStatus status,
+        int attempt,
         String failureReason
 ) {
-    public boolean hasPayload() {
-        return amount != null;
-    }
 }

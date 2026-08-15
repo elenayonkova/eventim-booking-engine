@@ -7,7 +7,7 @@ public record PaymentResult(
         UUID reservationId,
         long amount,
         String currency,
-        String paymentMethodFingerprint,
+        String paymentMethodTokenDigest,
         PaymentStatus status,
         String failureReason
 ) {

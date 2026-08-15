@@ -1,33 +1,50 @@
 package com.eventim.booking.engine.payment.service;
 
 import java.time.Duration;
+import java.util.UUID;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
-import org.springframework.transaction.annotation.Transactional;
 
 import com.eventim.booking.engine.payment.repository.PaymentRepository;
 
 /**
- * Periodically marks abandoned provider operations as unresolved so callers do
- * not mistake an unknown external outcome for a failure or cancellation.
+ * Periodically recovers interrupted idempotent provider calls. Stale payments
+ * are retried automatically, while stale refunds are made eligible for the
+ * booking service's compensation retry.
  */
 @Component
 public class PaymentRecoveryJob {
 
-    private final PaymentRepository paymentRepository;
+    private static final Logger LOGGER = LoggerFactory.getLogger(PaymentRecoveryJob.class);
 
-    public PaymentRecoveryJob(PaymentRepository paymentRepository) {
+    private final PaymentRepository paymentRepository;
+    private final PaymentService paymentService;
+    private final Duration providerAttemptTimeout;
+
+    public PaymentRecoveryJob(
+            PaymentRepository paymentRepository,
+            PaymentService paymentService,
+            @Value("${payment.provider-attempt-timeout}") Duration providerAttemptTimeout
+    ) {
         this.paymentRepository = paymentRepository;
+        this.paymentService = paymentService;
+        this.providerAttemptTimeout = providerAttemptTimeout;
     }
 
     @Scheduled(fixedDelayString = "${payment.recovery-sweep-ms}")
-    @Transactional
     public void recoverInterruptedOperations() {
-        Duration timeout = Duration.ofMinutes(2);
-        // A real provider integration can later reconcile UNKNOWN rows by the
-        // durable payment ID. Until then, an unknown outcome must stay non-terminal.
-        paymentRepository.markStalePaymentsUnknown(timeout);
-        paymentRepository.failStaleProcessingRefunds(timeout);
+        paymentRepository.failStaleProcessingRefunds(providerAttemptTimeout);
+        for (UUID reservationId
+                : paymentRepository.findStaleProcessingReservationIds(providerAttemptTimeout)) {
+            try {
+                paymentService.recoverPayment(reservationId);
+            } catch (RuntimeException exception) {
+                LOGGER.warn("Could not recover payment for reservation {}", reservationId, exception);
+            }
+        }
     }
 }

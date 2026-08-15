@@ -35,11 +35,10 @@ public class BookingService {
 
     @Transactional
     public SeatAvailabilityResponse getSeats(String eventId) {
-        bookingRepository.releaseExpiredHoldsForEvent(eventId);
-
-        if (!bookingRepository.eventExists(eventId)) {
+        if (bookingRepository.findEventCurrency(eventId).isEmpty()) {
             throw new NotFoundException("Event not found: " + eventId);
         }
+        bookingRepository.releaseExpiredHoldsForEvent(eventId);
 
         List<SeatAvailabilityResponse.Seat> seats = new ArrayList<>();
         for (SeatAvailabilityRow row : bookingRepository.findSeats(eventId)) {

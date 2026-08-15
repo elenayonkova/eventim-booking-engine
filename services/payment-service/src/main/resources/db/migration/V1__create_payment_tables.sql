@@ -1,38 +1,30 @@
 create table payments (
     id uuid primary key,
     reservation_id uuid not null unique,
-    amount bigint,
-    currency char(3),
-    payment_method_fingerprint text,
+    amount bigint not null check (amount > 0),
+    currency char(3) not null,
+    payment_method_token varchar(256),
+    payment_method_token_digest varchar(64) not null,
     status text not null check (
         status in (
             'PROCESSING',
-            'CANCELLATION_PENDING',
-            'UNKNOWN',
-            'CANCELLED',
             'SUCCEEDED',
             'FAILED',
             'REFUNDED'
         )
     ),
+    attempt integer not null default 1 check (attempt > 0),
     failure_reason text,
     created_at timestamptz not null default now(),
-    updated_at timestamptz not null default now(),
-    constraint chk_payment_payload check (
-        (
-            amount is null
-            and currency is null
-            and payment_method_fingerprint is null
-            and status = 'CANCELLED'
-        )
-        or
-        (
-            amount > 0
-            and currency is not null
-            and payment_method_fingerprint is not null
-        )
-    )
+    updated_at timestamptz not null default now()
 );
+
+comment on column payments.payment_method_token is
+    'Temporary simulated provider token retained only while payment recovery is pending';
+
+create index idx_payments_processing_updated_at
+    on payments(updated_at, id)
+    where status = 'PROCESSING';
 
 create table refunds (
     id uuid primary key,
@@ -43,10 +35,6 @@ create table refunds (
     created_at timestamptz not null default now(),
     updated_at timestamptz not null default now()
 );
-
-create index idx_payments_processing_updated_at
-    on payments(updated_at, reservation_id)
-    where status in ('PROCESSING', 'CANCELLATION_PENDING');
 
 create index idx_refunds_processing_updated_at
     on refunds(updated_at, reservation_id)

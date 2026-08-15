@@ -8,7 +8,6 @@ import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
 
-import java.time.Duration;
 import java.time.OffsetDateTime;
 import java.util.List;
 import java.util.UUID;
@@ -33,7 +32,7 @@ class ReservationCheckoutTest {
 
     private static final long AMOUNT = 5_000;
     private static final String CURRENCY = "EUR";
-    private static final String FINGERPRINT = "fingerprint";
+    private static final String TOKEN_DIGEST = "token-digest";
 
     @Mock
     BookingRepository bookingRepository;
@@ -58,12 +57,14 @@ class ReservationCheckoutTest {
 
         CheckoutSnapshot checkout = reservationCheckout.beginCheckout(
                 reservationId,
-                FINGERPRINT);
+                TOKEN_DIGEST);
 
         assertThat(checkout.amount()).isEqualTo(AMOUNT);
         assertThat(checkout.currency()).isEqualTo(CURRENCY);
         assertThat(checkout.status()).isEqualTo(ReservationStatus.PAYMENT_PENDING);
-        verify(bookingRepository).markPaymentPending(reservationId, FINGERPRINT);
+        verify(bookingRepository).markPaymentPending(
+                reservationId,
+                TOKEN_DIGEST);
     }
 
     @Test
@@ -175,27 +176,6 @@ class ReservationCheckoutTest {
         verifyNoMoreInteractions(bookingRepository);
     }
 
-    @Test
-    void paymentPendingCheckoutIsTimedOutAtTheExactBoundary() {
-        UUID reservationId = UUID.randomUUID();
-        OffsetDateTime checkoutStartedAt = OffsetDateTime.now();
-        Duration timeout = Duration.ofMinutes(3);
-        ReservationRow reservation = checkoutReservation(
-                reservationId,
-                UUID.randomUUID(),
-                ReservationStatus.PAYMENT_PENDING,
-                checkoutStartedAt);
-        when(bookingRepository.lockReservation(reservationId)).thenReturn(reservation);
-        when(bookingRepository.databaseNow()).thenReturn(checkoutStartedAt.plus(timeout));
-
-        CheckoutSnapshot result = reservationCheckout.loadTimedOutPaymentPendingCheckout(
-                reservationId,
-                timeout);
-
-        assertThat(result).isNotNull();
-        assertThat(result.status()).isEqualTo(ReservationStatus.PAYMENT_PENDING);
-    }
-
     private ReservationRow heldReservation(UUID reservationId, OffsetDateTime expiresAt) {
         return new ReservationRow(
                 reservationId,
@@ -206,7 +186,6 @@ class ReservationCheckoutTest {
                 AMOUNT,
                 CURRENCY,
                 null,
-                null,
                 null);
     }
 
@@ -214,18 +193,17 @@ class ReservationCheckoutTest {
             UUID reservationId,
             UUID paymentId,
             ReservationStatus status,
-            OffsetDateTime checkoutStartedAt
+            OffsetDateTime stateTime
     ) {
         return new ReservationRow(
                 reservationId,
                 "event-1",
                 status,
-                checkoutStartedAt.plusMinutes(5),
+                stateTime.plusMinutes(5),
                 paymentId,
                 AMOUNT,
                 CURRENCY,
-                FINGERPRINT,
-                checkoutStartedAt,
+                TOKEN_DIGEST,
                 null);
     }
 
@@ -236,7 +214,7 @@ class ReservationCheckoutTest {
                 ReservationStatus.PAYMENT_PENDING,
                 AMOUNT,
                 CURRENCY,
-                FINGERPRINT,
+                TOKEN_DIGEST,
                 null);
     }
 
@@ -254,7 +232,7 @@ class ReservationCheckoutTest {
                 reservationId,
                 AMOUNT,
                 CURRENCY,
-                FINGERPRINT,
+                TOKEN_DIGEST,
                 status,
                 null);
     }

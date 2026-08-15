@@ -39,9 +39,10 @@ spec:
             holdTtl: {type: string, default: "5m"}
             expirySweepMs: {type: integer, default: 30000, minimum: 1000}
             paymentConnectTimeout: {type: string, default: "2s"}
-            paymentReadTimeout: {type: string, default: "10s"}
-            paymentPendingTimeout: {type: string, default: "3m"}
+            paymentReadTimeout: {type: string, default: "65s"}
+            paymentMissingTimeout: {type: string, default: "90s"}
             paymentReconciliationSweepMs: {type: integer, default: 30000, minimum: 1000}
+            refundReconciliationSweepMs: {type: integer, default: 30000, minimum: 1000}
         payment:
           type: object
           additionalProperties: false
@@ -49,6 +50,7 @@ spec:
             image: {type: string, default: "eventim/payment-service:dev"}
             replicas: {type: integer, default: 2, minimum: 1}
             recoverySweepMs: {type: integer, default: 30000, minimum: 1000}
+            providerAttemptTimeout: {type: string, default: "90s"}
         postgres:
           type: object
           additionalProperties: false

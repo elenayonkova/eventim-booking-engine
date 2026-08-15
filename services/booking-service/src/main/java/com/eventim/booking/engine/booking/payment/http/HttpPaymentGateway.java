@@ -1,21 +1,19 @@
 package com.eventim.booking.engine.booking.payment.http;
 
-import java.util.Optional;
 import java.util.UUID;
+import java.util.Optional;
 
-import org.springframework.web.client.HttpClientErrorException;
 import org.springframework.web.client.RestClient;
 import org.springframework.web.client.RestClientException;
+import org.springframework.web.client.HttpClientErrorException;
 
 import com.eventim.booking.engine.booking.payment.ChargePayment;
 import com.eventim.booking.engine.booking.payment.PaymentGateway;
-import com.eventim.booking.engine.booking.payment.PaymentCancellationResult;
 import com.eventim.booking.engine.booking.payment.PaymentResult;
 import com.eventim.booking.engine.booking.payment.PaymentSimulation;
 import com.eventim.booking.engine.booking.payment.PaymentStatus;
 import com.eventim.booking.engine.booking.payment.RefundResult;
 import com.eventim.booking.engine.booking.payment.RefundStatus;
-import com.eventim.booking.engine.booking.service.ConflictException;
 import com.eventim.booking.engine.booking.service.ExternalServiceException;
 
 /**
@@ -29,6 +27,24 @@ public class HttpPaymentGateway implements PaymentGateway {
 
     public HttpPaymentGateway(RestClient restClient) {
         this.restClient = restClient;
+    }
+
+    @Override
+    public Optional<PaymentResult> findPayment(UUID reservationId) {
+        try {
+            PaymentResponse response = restClient.get()
+                    .uri("/v1/payments/{reservationId}", reservationId)
+                    .retrieve()
+                    .body(PaymentResponse.class);
+            if (response == null) {
+                throw new ExternalServiceException("Payment service returned an empty response");
+            }
+            return Optional.of(response.toResult());
+        } catch (HttpClientErrorException.NotFound exception) {
+            return Optional.empty();
+        } catch (RestClientException exception) {
+            throw new ExternalServiceException("Payment status could not be determined", exception);
+        }
     }
 
     @Override
@@ -50,48 +66,8 @@ public class HttpPaymentGateway implements PaymentGateway {
                 throw new ExternalServiceException("Payment service returned an empty response");
             }
             return response.toResult();
-        } catch (HttpClientErrorException.Conflict exception) {
-            throw new ConflictException("Payment service rejected the idempotency payload");
         } catch (RestClientException exception) {
             throw new ExternalServiceException("Payment outcome is unknown; retry checkout safely", exception);
-        }
-    }
-
-    @Override
-    public Optional<PaymentResult> find(UUID reservationId) {
-        try {
-            PaymentResponse response = restClient.get()
-                    .uri("/v1/payments/by-reservation/{reservationId}", reservationId)
-                    .retrieve()
-                    .body(PaymentResponse.class);
-            if (response == null) {
-                return Optional.empty();
-            }
-            return Optional.of(response.toResult());
-        } catch (HttpClientErrorException.NotFound exception) {
-            return Optional.empty();
-        } catch (RestClientException exception) {
-            throw new ExternalServiceException("Payment status could not be retrieved", exception);
-        }
-    }
-
-    @Override
-    public PaymentCancellationResult cancel(UUID reservationId) {
-        try {
-            PaymentCancellationResponse response = restClient.post()
-                    .uri("/v1/payments/cancellations")
-                    .body(new PaymentCancellationRequest(reservationId))
-                    .retrieve()
-                    .body(PaymentCancellationResponse.class);
-            if (response == null) {
-                throw new ExternalServiceException(
-                        "Payment service returned an empty cancellation response");
-            }
-            return response.toResult();
-        } catch (RestClientException exception) {
-            throw new ExternalServiceException(
-                    "Payment cancellation could not be confirmed; reservation remains pending",
-                    exception);
         }
     }
 
@@ -129,26 +105,12 @@ public class HttpPaymentGateway implements PaymentGateway {
     ) {
     }
 
-    private record PaymentCancellationRequest(UUID reservationId) {
-    }
-
-    private record PaymentCancellationResponse(
-            UUID reservationId,
-            PaymentResponse payment
-    ) {
-        PaymentCancellationResult toResult() {
-            return new PaymentCancellationResult(
-                    reservationId,
-                    payment == null ? null : payment.toResult());
-        }
-    }
-
     private record PaymentResponse(
             UUID paymentId,
             UUID reservationId,
             long amount,
             String currency,
-            String paymentMethodFingerprint,
+            String paymentMethodTokenDigest,
             PaymentStatus status,
             String failureReason
     ) {
@@ -158,7 +120,7 @@ public class HttpPaymentGateway implements PaymentGateway {
                     reservationId,
                     amount,
                     currency,
-                    paymentMethodFingerprint,
+                    paymentMethodTokenDigest,
                     status,
                     failureReason);
         }

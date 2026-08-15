@@ -122,25 +122,6 @@ expect_json "${inventory_after_failure}" \
   ".seats[] | select(.seatId == \"${failure_seat}\") | .status == \"AVAILABLE\"" \
   'Failed payment releases its seat'
 
-tombstone_reservation_id="$(uuidgen | tr '[:upper:]' '[:lower:]')"
-tombstone="$(request POST "${payment_url}/v1/payments/cancellations" "$(jq --null-input \
-  --arg reservationId "${tombstone_reservation_id}" \
-  '{reservationId:$reservationId}')")"
-expect_json "${tombstone}" '.payment == null' \
-  'Cancellation before payment creates a payloadless tombstone'
-late_charge_status="$(curl --silent --output "${temporary_dir}/late-charge.json" --write-out '%{http_code}' \
-  --request POST \
-  --header 'Content-Type: application/json' \
-  --data "$(jq --null-input \
-    --arg reservationId "${tombstone_reservation_id}" \
-    '{reservationId:$reservationId,amount:5000,currency:"EUR",paymentMethodToken:"tok_too_late"}')" \
-  "${payment_url}/v1/payments")"
-if [[ "${late_charge_status}" != '409' ]]; then
-  echo "FAILED: late charge returned HTTP ${late_charge_status}, expected 409" >&2
-  exit 1
-fi
-echo 'PASS: a cancellation tombstone blocks a late charge with HTTP 409'
-
 refund_reservation_id="$(uuidgen | tr '[:upper:]' '[:lower:]')"
 refund_payment="$(request POST "${payment_url}/v1/payments" "$(jq --null-input \
   --arg reservationId "${refund_reservation_id}" \
@@ -154,15 +135,17 @@ failed_refund="$(request POST "${payment_url}/v1/refunds" "$(jq --null-input \
 retried_refund="$(request POST "${payment_url}/v1/refunds" "$(jq --null-input \
   --arg reservationId "${refund_reservation_id}" \
   '{reservationId:$reservationId}')")"
+repeated_refund="$(request POST "${payment_url}/v1/refunds" "$(jq --null-input \
+  --arg reservationId "${refund_reservation_id}" \
+  '{reservationId:$reservationId}')")"
 failed_refund_id="$(jq --raw-output '.refundId' <<<"${failed_refund}")"
 expect_json "${failed_refund}" '.status == "FAILED"' \
   'The first refund attempt fails durably'
 expect_json "${retried_refund}" \
   ".status == \"SUCCEEDED\" and .refundId == \"${failed_refund_id}\"" \
   'Refund retry succeeds with the same refund ID'
-refunded_payment="$(request GET \
-  "${payment_url}/v1/payments/by-reservation/${refund_reservation_id}")"
-expect_json "${refunded_payment}" '.status == "REFUNDED"' \
-  'Successful retry marks the payment REFUNDED'
+expect_json "${repeated_refund}" \
+  ".status == \"SUCCEEDED\" and .refundId == \"${failed_refund_id}\"" \
+  'A completed refund is returned idempotently'
 
 echo 'All curl smoke tests passed.'

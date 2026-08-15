@@ -13,8 +13,7 @@ public record ReservationRow(
         UUID paymentId,
         long checkoutAmount,
         String checkoutCurrency,
-        String paymentMethodFingerprint,
-        OffsetDateTime checkoutStartedAt,
+        String paymentMethodTokenDigest,
         String paymentFailureReason
 ) {
 }

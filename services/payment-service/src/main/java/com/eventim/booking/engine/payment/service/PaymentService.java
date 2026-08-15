@@ -6,17 +6,13 @@ import java.security.NoSuchAlgorithmException;
 import java.util.HexFormat;
 import java.util.UUID;
 
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import com.eventim.booking.engine.payment.api.PaymentRequest;
 import com.eventim.booking.engine.payment.api.PaymentResponse;
-import com.eventim.booking.engine.payment.api.PaymentCancellationRequest;
-import com.eventim.booking.engine.payment.api.PaymentCancellationResponse;
 import com.eventim.booking.engine.payment.api.RefundRequest;
 import com.eventim.booking.engine.payment.api.RefundResponse;
 import com.eventim.booking.engine.payment.provider.PaymentProvider;
-import com.eventim.booking.engine.payment.provider.PaymentProvider.CancellationOutcome;
 import com.eventim.booking.engine.payment.provider.PaymentProvider.OperationOutcome;
 import com.eventim.booking.engine.payment.provider.PaymentProvider.Simulation;
 
@@ -32,72 +28,63 @@ public class PaymentService {
 
     private final PaymentTransactions paymentTransactions;
     private final PaymentProvider paymentProvider;
-    private final boolean simulationEnabled;
 
     public PaymentService(
             PaymentTransactions paymentTransactions,
-            PaymentProvider paymentProvider,
-            @Value("${payment.simulation-enabled}") boolean simulationEnabled
+            PaymentProvider paymentProvider
     ) {
         this.paymentTransactions = paymentTransactions;
         this.paymentProvider = paymentProvider;
-        this.simulationEnabled = simulationEnabled;
     }
 
     public PaymentResponse createPayment(PaymentRequest request, Long delayMs, String simulateFailure) {
         Simulation simulation = simulation(delayMs, simulateFailure);
-        String fingerprint = fingerprint(request.paymentMethodToken());
+        String requestTokenDigest = tokenDigest(request.paymentMethodToken());
         ProviderStep<PaymentResponse> step = paymentTransactions.startPayment(
                 request,
-                fingerprint);
+                requestTokenDigest);
 
         if (!step.providerCallRequired()) {
             return step.response();
         }
 
-        // REAL PROVIDER CALL: a production PaymentProvider submits the charge
-        // here using the durable payment ID as its idempotency key.
+        // SIMULATED PROVIDER CALL: the durable payment ID is the idempotency key.
+        PaymentRequest providerRequest = step.providerRequest();
+        String providerTokenDigest = tokenDigest(providerRequest.paymentMethodToken());
         OperationOutcome outcome = paymentProvider.charge(
                 step.response().paymentId(),
-                request,
+                providerRequest,
                 simulation);
-        return paymentTransactions.completePayment(request, fingerprint, outcome);
-    }
-
-    public PaymentResponse getPayment(UUID reservationId) {
-        return paymentTransactions.getPayment(reservationId);
-    }
-
-    public PaymentCancellationResponse cancelPayment(
-            PaymentCancellationRequest request,
-            Long delayMs,
-            String simulateFailure
-    ) {
-        Simulation simulation = simulation(delayMs, simulateFailure);
-        ProviderStep<PaymentCancellationResponse> step = paymentTransactions.startCancellation(
-                request.reservationId());
-
-        if (!step.providerCallRequired()) {
-            return step.response();
-        }
-
-        PaymentResponse payment = step.response().payment();
-        if (payment == null) {
-            throw new IllegalStateException("Provider cancellation requires a payment");
-        }
-
-        // REAL PROVIDER CALL: a production PaymentProvider asks the provider to
-        // cancel or resolve the processing charge here, outside the transaction.
-        CancellationOutcome outcome = paymentProvider.cancel(
-                payment.paymentId(),
-                request,
-                simulation);
-        return paymentTransactions.completeCancellation(
-                request.reservationId(),
+        return paymentTransactions.completePayment(
+                providerRequest,
+                providerTokenDigest,
+                step.attempt(),
                 outcome);
     }
 
-    public RefundResponse refund(RefundRequest request, Long delayMs, String simulateFailure) {
+    public PaymentResponse getPayment(UUID reservationId) {
+        return paymentTransactions.findPayment(reservationId);
+    }
+
+    public PaymentResponse recoverPayment(UUID reservationId) {
+        ProviderStep<PaymentResponse> step = paymentTransactions.startPaymentRecovery(reservationId);
+        if (!step.providerCallRequired()) {
+            return step.response();
+        }
+
+        PaymentRequest providerRequest = step.providerRequest();
+        OperationOutcome outcome = paymentProvider.charge(
+                step.response().paymentId(),
+                providerRequest,
+                simulation(null, null));
+        return paymentTransactions.completePayment(
+                providerRequest,
+                tokenDigest(providerRequest.paymentMethodToken()),
+                step.attempt(),
+                outcome);
+    }
+
+    public RefundResponse createRefund(RefundRequest request, Long delayMs, String simulateFailure) {
         Simulation simulation = simulation(delayMs, simulateFailure);
         RefundStep step = paymentTransactions.startRefund(request);
 
@@ -105,8 +92,7 @@ public class PaymentService {
             return step.response();
         }
 
-        // REAL PROVIDER CALL: a production PaymentProvider submits the refund
-        // here using the durable refund ID as its idempotency key.
+        // SIMULATED PROVIDER CALL: the durable refund ID is the idempotency key.
         OperationOutcome outcome = paymentProvider.refund(
                 step.response().refundId(),
                 step.response().paymentId(),
@@ -128,14 +114,11 @@ public class PaymentService {
 
     private Simulation simulation(Long delayMs, String simulateFailure) {
         Simulation simulation = new Simulation(delayMs, simulateFailure);
-        if (!simulationEnabled && simulation.requested()) {
-            throw new IllegalArgumentException("Payment simulation is disabled");
-        }
         validateSimulationDelay(delayMs);
         return simulation;
     }
 
-    private String fingerprint(String paymentMethodToken) {
+    private String tokenDigest(String paymentMethodToken) {
         try {
             MessageDigest digest = MessageDigest.getInstance("SHA-256");
             byte[] hash = digest.digest(paymentMethodToken.getBytes(StandardCharsets.UTF_8));

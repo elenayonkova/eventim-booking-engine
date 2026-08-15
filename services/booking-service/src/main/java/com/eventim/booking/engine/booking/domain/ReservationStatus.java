@@ -10,13 +10,9 @@ public enum ReservationStatus {
     REFUNDED;
 
     public boolean hasCheckoutResponse() {
-        switch (this) {
-            case BOOKED:
-            case PAYMENT_FAILED:
-            case REFUNDED:
-                return true;
-            default:
-                return false;
-        }
+        return switch (this) {
+            case BOOKED, PAYMENT_FAILED, REFUNDED -> true;
+            case HELD, PAYMENT_PENDING, EXPIRED, REFUND_REQUIRED -> false;
+        };
     }
 }

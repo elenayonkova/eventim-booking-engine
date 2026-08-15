@@ -25,23 +25,10 @@ import com.eventim.booking.engine.payment.domain.RefundStatus;
 public class PaymentRepository {
 
     private static final String PAYMENT_COLUMNS =
-            "id, reservation_id, amount, currency, payment_method_fingerprint, status, failure_reason";
+            "id, reservation_id, amount, currency, payment_method_token, payment_method_token_digest, "
+                    + "status, attempt, failure_reason";
     private static final String REFUND_COLUMNS =
             "id, reservation_id, payment_id, status, attempt";
-
-    private static final RowMapper<PaymentRecord> PAYMENT_ROW_MAPPER = new RowMapper<PaymentRecord>() {
-        @Override
-        public PaymentRecord mapRow(ResultSet rs, int rowNum) throws SQLException {
-            return new PaymentRecord(
-                    rs.getObject("id", UUID.class),
-                    rs.getObject("reservation_id", UUID.class),
-                    rs.getObject("amount", Long.class),
-                    rs.getString("currency"),
-                    rs.getString("payment_method_fingerprint"),
-                    PaymentStatus.valueOf(rs.getString("status")),
-                    rs.getString("failure_reason"));
-        }
-    };
 
     private static final RowMapper<RefundRecord> REFUND_ROW_MAPPER = new RowMapper<RefundRecord>() {
         @Override
@@ -56,25 +43,31 @@ public class PaymentRepository {
     };
 
     private final NamedParameterJdbcTemplate jdbc;
+    private final RowMapper<PaymentRecord> paymentRowMapper;
 
     public PaymentRepository(NamedParameterJdbcTemplate jdbc) {
         this.jdbc = jdbc;
-    }
-
-    public Optional<PaymentRecord> findPaymentByReservationId(UUID reservationId) {
-        return findPaymentByReservationId(reservationId, false);
+        this.paymentRowMapper = (rs, rowNum) -> {
+            UUID reservationId = rs.getObject("reservation_id", UUID.class);
+            return new PaymentRecord(
+                    rs.getObject("id", UUID.class),
+                    reservationId,
+                    rs.getLong("amount"),
+                    rs.getString("currency"),
+                    rs.getString("payment_method_token"),
+                    rs.getString("payment_method_token_digest"),
+                    PaymentStatus.valueOf(rs.getString("status")),
+                    rs.getInt("attempt"),
+                    rs.getString("failure_reason"));
+        };
     }
 
     public Optional<PaymentRecord> findPaymentByReservationIdForUpdate(UUID reservationId) {
         return findPaymentByReservationId(reservationId, true);
     }
 
-    public PaymentRecord lockPayment(UUID reservationId) {
-        return jdbc.queryForObject(
-                "select " + PAYMENT_COLUMNS
-                        + " from payments where reservation_id = :reservationId for update",
-                Map.of("reservationId", reservationId),
-                PAYMENT_ROW_MAPPER);
+    public Optional<PaymentRecord> findPaymentByReservationId(UUID reservationId) {
+        return findPaymentByReservationId(reservationId, false);
     }
 
     private Optional<PaymentRecord> findPaymentByReservationId(
@@ -88,10 +81,18 @@ public class PaymentRepository {
                             + " from payments where reservation_id = :reservationId"
                             + lockClause,
                     Map.of("reservationId", reservationId),
-                    PAYMENT_ROW_MAPPER));
+                    paymentRowMapper));
         } catch (EmptyResultDataAccessException exception) {
             return Optional.empty();
         }
+    }
+
+    public PaymentRecord lockPayment(UUID reservationId) {
+        return jdbc.queryForObject(
+                "select " + PAYMENT_COLUMNS
+                        + " from payments where reservation_id = :reservationId for update",
+                Map.of("reservationId", reservationId),
+                paymentRowMapper);
     }
 
     public LockedPayment lockOrCreatePayment(PaymentRecord candidate) {
@@ -102,8 +103,10 @@ public class PaymentRepository {
                     reservation_id,
                     amount,
                     currency,
-                    payment_method_fingerprint,
+                    payment_method_token,
+                    payment_method_token_digest,
                     status,
+                    attempt,
                     failure_reason
                 )
                 values (
@@ -111,8 +114,10 @@ public class PaymentRepository {
                     :reservationId,
                     :amount,
                     :currency,
-                    :paymentMethodFingerprint,
+                    :paymentMethodToken,
+                    :paymentMethodTokenDigest,
                     :status,
+                    :attempt,
                     :failureReason
                 )
                 on conflict (reservation_id) do nothing
@@ -120,12 +125,14 @@ public class PaymentRepository {
                           reservation_id,
                           amount,
                           currency,
-                          payment_method_fingerprint,
+                          payment_method_token,
+                          payment_method_token_digest,
                           status,
+                          attempt,
                           failure_reason
                 """,
                 paymentParams(candidate),
-                PAYMENT_ROW_MAPPER);
+                paymentRowMapper);
         if (!inserted.isEmpty()) {
             return new LockedPayment(inserted.get(0), true);
         }
@@ -134,7 +141,7 @@ public class PaymentRepository {
                 "select " + PAYMENT_COLUMNS
                         + " from payments where reservation_id = :reservationId for update",
                 Map.of("reservationId", candidate.reservationId()),
-                PAYMENT_ROW_MAPPER);
+                paymentRowMapper);
         return new LockedPayment(current, false);
     }
 
@@ -143,7 +150,8 @@ public class PaymentRepository {
             UUID reservationId,
             long amount,
             String currency,
-            String paymentMethodFingerprint,
+            String paymentMethodToken,
+            String paymentMethodTokenDigest,
             PaymentStatus status,
             String failureReason
     ) {
@@ -152,8 +160,10 @@ public class PaymentRepository {
                 reservationId,
                 amount,
                 currency,
-                paymentMethodFingerprint,
+                paymentMethodToken,
+                paymentMethodTokenDigest,
                 status,
+                1,
                 failureReason);
         jdbc.update(
                 """
@@ -162,8 +172,10 @@ public class PaymentRepository {
                     reservation_id,
                     amount,
                     currency,
-                    payment_method_fingerprint,
+                    payment_method_token,
+                    payment_method_token_digest,
                     status,
+                    attempt,
                     failure_reason
                 )
                 values (
@@ -171,8 +183,10 @@ public class PaymentRepository {
                     :reservationId,
                     :amount,
                     :currency,
-                    :paymentMethodFingerprint,
+                    :paymentMethodToken,
+                    :paymentMethodTokenDigest,
                     :status,
+                    :attempt,
                     :failureReason
                 )
                 """,
@@ -180,65 +194,97 @@ public class PaymentRepository {
         return payment;
     }
 
-    public PaymentRecord markCancellationPending(UUID paymentId) {
-        return transitionPayment(
-                paymentId,
-                PaymentStatus.PROCESSING,
-                PaymentStatus.CANCELLATION_PENDING,
-                null);
-    }
-
     public PaymentRecord completeProcessingPayment(
             UUID paymentId,
+            int attempt,
             PaymentStatus status,
-            String failureReason
-    ) {
-        return transitionPayment(
-                paymentId,
-                PaymentStatus.PROCESSING,
-                status,
-                failureReason);
-    }
-
-    public PaymentRecord completePendingCancellation(
-            UUID paymentId,
-            PaymentStatus status,
-            String failureReason
-    ) {
-        return transitionPayment(
-                paymentId,
-                PaymentStatus.CANCELLATION_PENDING,
-                status,
-                failureReason);
-    }
-
-    private PaymentRecord transitionPayment(
-            UUID paymentId,
-            PaymentStatus expectedStatus,
-            PaymentStatus newStatus,
             String failureReason
     ) {
         jdbc.update(
                 """
                 update payments
-                set status = :newStatus,
+                set status = :status,
+                    payment_method_token = null,
                     failure_reason = :failureReason,
                     updated_at = now()
                 where id = :paymentId
-                  and status = :expectedStatus
+                  and status = 'PROCESSING'
+                  and attempt = :attempt
                 """,
                 new MapSqlParameterSource()
                         .addValue("paymentId", paymentId)
-                        .addValue("expectedStatus", expectedStatus.name())
-                        .addValue("newStatus", newStatus.name())
+                        .addValue("attempt", attempt)
+                        .addValue("status", status.name())
                         .addValue("failureReason", failureReason));
         return findPaymentById(paymentId);
     }
 
-    public void touchPayment(UUID paymentId) {
-        jdbc.update(
-                "update payments set updated_at = now() where id = :paymentId",
-                Map.of("paymentId", paymentId));
+    public Optional<PaymentRecord> claimStaleProcessingPayment(
+            UUID paymentId,
+            Duration attemptTimeout
+    ) {
+        List<PaymentRecord> claimed = jdbc.query(
+                """
+                update payments
+                set attempt = attempt + 1,
+                    updated_at = now()
+                where id = :paymentId
+                  and status = 'PROCESSING'
+                  and updated_at <= now() - (:timeoutMillis * interval '1 millisecond')
+                returning id,
+                          reservation_id,
+                          amount,
+                          currency,
+                          payment_method_token,
+                          payment_method_token_digest,
+                          status,
+                          attempt,
+                          failure_reason
+                """,
+                new MapSqlParameterSource()
+                        .addValue("paymentId", paymentId)
+                        .addValue("timeoutMillis", attemptTimeout.toMillis()),
+                paymentRowMapper);
+        return claimed.stream().findFirst();
+    }
+
+    public PaymentRecord attachProcessingPaymentToken(UUID paymentId, String paymentMethodToken) {
+        return jdbc.queryForObject(
+                """
+                update payments
+                set payment_method_token = :paymentMethodToken,
+                    updated_at = now()
+                where id = :paymentId
+                  and status = 'PROCESSING'
+                  and payment_method_token is null
+                returning id,
+                          reservation_id,
+                          amount,
+                          currency,
+                          payment_method_token,
+                          payment_method_token_digest,
+                          status,
+                          attempt,
+                          failure_reason
+                """,
+                new MapSqlParameterSource()
+                        .addValue("paymentId", paymentId)
+                        .addValue("paymentMethodToken", paymentMethodToken),
+                paymentRowMapper);
+    }
+
+    public List<UUID> findStaleProcessingReservationIds(Duration attemptTimeout) {
+        return jdbc.query(
+                """
+                select reservation_id
+                from payments
+                where status = 'PROCESSING'
+                  and updated_at <= now() - (:timeoutMillis * interval '1 millisecond')
+                order by updated_at, reservation_id
+                limit 100
+                """,
+                Map.of("timeoutMillis", attemptTimeout.toMillis()),
+                (rs, rowNum) -> rs.getObject("reservation_id", UUID.class));
     }
 
     public void markPaymentRefunded(UUID paymentId) {
@@ -338,19 +384,6 @@ public class PaymentRepository {
         return findRefundById(refundId);
     }
 
-    public int markStalePaymentsUnknown(Duration timeout) {
-        return jdbc.update(
-                """
-                update payments
-                set status = 'UNKNOWN',
-                    failure_reason = 'Payment provider outcome is unknown; reconciliation required',
-                    updated_at = now()
-                where status in ('PROCESSING', 'CANCELLATION_PENDING')
-                  and updated_at <= now() - (:timeoutSeconds * interval '1 second')
-                """,
-                Map.of("timeoutSeconds", timeout.toSeconds()));
-    }
-
     public int failStaleProcessingRefunds(Duration timeout) {
         return jdbc.update(
                 """
@@ -367,7 +400,7 @@ public class PaymentRepository {
         return jdbc.queryForObject(
                 "select " + PAYMENT_COLUMNS + " from payments where id = :paymentId",
                 Map.of("paymentId", paymentId),
-                PAYMENT_ROW_MAPPER);
+                paymentRowMapper);
     }
 
     private RefundRecord findRefundById(UUID refundId) {
@@ -383,8 +416,10 @@ public class PaymentRepository {
                 .addValue("reservationId", payment.reservationId())
                 .addValue("amount", payment.amount())
                 .addValue("currency", payment.currency())
-                .addValue("paymentMethodFingerprint", payment.paymentMethodFingerprint())
+                .addValue("paymentMethodToken", payment.paymentMethodToken())
+                .addValue("paymentMethodTokenDigest", payment.paymentMethodTokenDigest())
                 .addValue("status", payment.status().name())
+                .addValue("attempt", payment.attempt())
                 .addValue("failureReason", payment.failureReason());
     }
 

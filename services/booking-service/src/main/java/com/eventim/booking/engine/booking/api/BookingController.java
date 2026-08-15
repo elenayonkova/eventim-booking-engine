@@ -1,10 +1,12 @@
 package com.eventim.booking.engine.booking.api;
 
+import static com.eventim.booking.engine.booking.api.CreateReservationRequest.MAX_EVENT_ID_LENGTH;
 import static com.eventim.booking.engine.booking.payment.PaymentSimulation.MAX_DELAY_MS;
 
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.Max;
 import jakarta.validation.constraints.Min;
+import jakarta.validation.constraints.Size;
 
 import org.springframework.http.HttpStatus;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -37,7 +39,8 @@ public class BookingController {
     }
 
     @GetMapping("/events/{eventId}/seats")
-    public SeatAvailabilityResponse getSeats(@PathVariable String eventId) {
+    public SeatAvailabilityResponse getSeats(
+            @PathVariable @Size(max = MAX_EVENT_ID_LENGTH) String eventId) {
         return bookingService.getSeats(eventId);
     }
 
@@ -48,10 +51,10 @@ public class BookingController {
     }
 
     @PostMapping("/checkout")
-    public CheckoutResponse checkout(@Valid @RequestBody CheckoutRequest request,
+    public CheckoutResponse completeCheckout(@Valid @RequestBody CheckoutRequest request,
             @RequestHeader(name = "X-Simulate-Delay-Ms", required = false)
             @Min(0) @Max(MAX_DELAY_MS) Long simulatedDelayMs,
             @RequestHeader(name = "X-Simulate-Failure", required = false) String simulatedFailure) {
-        return checkoutService.checkout(request, simulatedDelayMs, simulatedFailure);
+        return checkoutService.completeCheckout(request, simulatedDelayMs, simulatedFailure);
     }
 }

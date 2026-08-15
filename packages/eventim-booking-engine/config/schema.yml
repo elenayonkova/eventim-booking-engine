@@ -7,13 +7,15 @@ booking:
   holdTtl: 5m
   expirySweepMs: 30000
   paymentConnectTimeout: 2s
-  paymentReadTimeout: 10s
-  paymentPendingTimeout: 3m
+  paymentReadTimeout: 65s
+  paymentMissingTimeout: 90s
   paymentReconciliationSweepMs: 30000
+  refundReconciliationSweepMs: 30000
 payment:
   image: eventim/payment-service:dev
   replicas: 2
   recoverySweepMs: 30000
+  providerAttemptTimeout: 90s
 postgres:
   image: postgres:17-alpine
   database: eventim

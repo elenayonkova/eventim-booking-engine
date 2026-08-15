@@ -17,7 +17,7 @@ record CheckoutSnapshot(
         ReservationStatus status,
         long amount,
         String currency,
-        String paymentMethodFingerprint,
+        String paymentMethodTokenDigest,
         String failureReason
 ) {
 
@@ -28,7 +28,7 @@ record CheckoutSnapshot(
                 reservation.status(),
                 reservation.checkoutAmount(),
                 reservation.checkoutCurrency(),
-                reservation.paymentMethodFingerprint(),
+                reservation.paymentMethodTokenDigest(),
                 reservation.paymentFailureReason());
     }
 
@@ -43,7 +43,7 @@ record CheckoutSnapshot(
                 newStatus,
                 amount,
                 currency,
-                paymentMethodFingerprint,
+                paymentMethodTokenDigest,
                 newFailureReason);
     }
 

@@ -3,7 +3,11 @@ package com.eventim.booking.engine.payment;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.time.Duration;
+import java.util.HexFormat;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.Callable;
@@ -25,15 +29,12 @@ import org.testcontainers.junit.jupiter.Testcontainers;
 
 import com.eventim.booking.engine.payment.api.PaymentRequest;
 import com.eventim.booking.engine.payment.api.PaymentResponse;
-import com.eventim.booking.engine.payment.api.PaymentCancellationRequest;
-import com.eventim.booking.engine.payment.api.PaymentCancellationResponse;
 import com.eventim.booking.engine.payment.api.RefundRequest;
 import com.eventim.booking.engine.payment.api.RefundResponse;
 import com.eventim.booking.engine.payment.domain.PaymentStatus;
 import com.eventim.booking.engine.payment.domain.RefundStatus;
 import com.eventim.booking.engine.payment.repository.PaymentRepository;
 import com.eventim.booking.engine.payment.service.ConflictException;
-import com.eventim.booking.engine.payment.service.NotFoundException;
 import com.eventim.booking.engine.payment.service.PaymentService;
 import com.eventim.booking.engine.payment.service.PaymentTransactions;
 
@@ -97,8 +98,10 @@ class PaymentServiceIntegrationTest {
                 assertThat(response.paymentId()).isEqualTo(responses.get(0).paymentId());
                 assertThat(response.amount()).isEqualTo(10_000);
                 assertThat(response.currency()).isEqualTo("EUR");
-                assertThat(response.paymentMethodFingerprint()).isNotBlank();
-                assertThat(response.status()).isIn(PaymentStatus.PROCESSING, PaymentStatus.SUCCEEDED);
+                assertThat(response.paymentMethodTokenDigest()).isNotBlank();
+                assertThat(response.status()).isIn(
+                        PaymentStatus.PROCESSING,
+                        PaymentStatus.SUCCEEDED);
             });
         } finally {
             executor.shutdownNow();
@@ -108,7 +111,133 @@ class PaymentServiceIntegrationTest {
                 "select count(*) from payment.payments where reservation_id = ?",
                 Integer.class,
                 reservationId)).isEqualTo(1);
-        assertThat(paymentService.getPayment(reservationId).status()).isEqualTo(PaymentStatus.SUCCEEDED);
+        assertThat(jdbc.queryForObject(
+                "select status from payment.payments where reservation_id = ?",
+                String.class,
+                reservationId)).isEqualTo("SUCCEEDED");
+    }
+
+    @Test
+    void retryDuringDelayedFailureDoesNotStartAnotherProviderAttempt() throws Exception {
+        UUID reservationId = UUID.randomUUID();
+        PaymentRequest request = new PaymentRequest(
+                reservationId,
+                10_000,
+                "EUR",
+                "pm-delayed-failure");
+
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        try {
+            Future<PaymentResponse> original = executor.submit(() ->
+                    paymentService.createPayment(request, 500L, "true"));
+            awaitPaymentAttempt(reservationId, 1, PaymentStatus.PROCESSING);
+
+            PaymentResponse retry = paymentService.createPayment(request, null, null);
+
+            assertThat(retry.status()).isEqualTo(PaymentStatus.PROCESSING);
+            assertThat(original.get().status()).isEqualTo(PaymentStatus.FAILED);
+        } finally {
+            executor.shutdownNow();
+        }
+
+        assertThat(jdbc.queryForObject(
+                "select attempt from payment.payments where reservation_id = ?",
+                Integer.class,
+                reservationId)).isEqualTo(1);
+        assertThat(jdbc.queryForObject(
+                "select status from payment.payments where reservation_id = ?",
+                String.class,
+                reservationId)).isEqualTo("FAILED");
+    }
+
+    @Test
+    void concurrentStaleRetriesClaimOneSimulatedProviderAttempt() throws Exception {
+        UUID reservationId = UUID.randomUUID();
+        PaymentRequest request = new PaymentRequest(
+                reservationId,
+                10_000,
+                "EUR",
+                "pm-stale");
+        paymentRepository.insertPayment(
+                UUID.randomUUID(),
+                reservationId,
+                request.amount(),
+                request.currency(),
+                request.paymentMethodToken(),
+                tokenDigest(request.paymentMethodToken()),
+                PaymentStatus.PROCESSING,
+                null);
+        jdbc.update(
+                "update payment.payments set updated_at = now() - interval '10 minutes' "
+                        + "where reservation_id = ?",
+                reservationId);
+
+        CountDownLatch ready = new CountDownLatch(2);
+        CountDownLatch start = new CountDownLatch(1);
+        Callable<PaymentResponse> retry = () -> {
+            ready.countDown();
+            start.await();
+            return paymentService.createPayment(request, 500L, "true");
+        };
+
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        try {
+            Future<PaymentResponse> first = executor.submit(retry);
+            Future<PaymentResponse> second = executor.submit(retry);
+            ready.await();
+            start.countDown();
+
+            assertThat(List.of(first.get().status(), second.get().status()))
+                    .containsExactlyInAnyOrder(
+                            PaymentStatus.PROCESSING,
+                            PaymentStatus.FAILED);
+        } finally {
+            executor.shutdownNow();
+        }
+
+        assertThat(jdbc.queryForObject(
+                "select attempt from payment.payments where reservation_id = ?",
+                Integer.class,
+                reservationId)).isEqualTo(2);
+        assertThat(jdbc.queryForObject(
+                "select status from payment.payments where reservation_id = ?",
+                String.class,
+                reservationId)).isEqualTo("FAILED");
+    }
+
+    @Test
+    void automaticRecoveryRetriesWithTheStoredTokenAndClearsItOnCompletion() {
+        UUID reservationId = UUID.randomUUID();
+        PaymentRequest request = new PaymentRequest(
+                reservationId,
+                10_000,
+                "EUR",
+                "pm-automatic-recovery");
+        paymentRepository.insertPayment(
+                UUID.randomUUID(),
+                reservationId,
+                request.amount(),
+                request.currency(),
+                request.paymentMethodToken(),
+                tokenDigest(request.paymentMethodToken()),
+                PaymentStatus.PROCESSING,
+                null);
+        jdbc.update(
+                "update payment.payments set updated_at = now() - interval '10 minutes' "
+                        + "where reservation_id = ?",
+                reservationId);
+
+        PaymentResponse recovered = paymentService.recoverPayment(reservationId);
+
+        assertThat(recovered.status()).isEqualTo(PaymentStatus.SUCCEEDED);
+        assertThat(jdbc.queryForObject(
+                "select attempt from payment.payments where reservation_id = ?",
+                Integer.class,
+                reservationId)).isEqualTo(2);
+        assertThat(jdbc.queryForObject(
+                "select payment_method_token is null from payment.payments where reservation_id = ?",
+                Boolean.class,
+                reservationId)).isTrue();
     }
 
     @Test
@@ -118,79 +247,9 @@ class PaymentServiceIntegrationTest {
                 new PaymentRequest(reservationId, 10_000, "EUR", "pm-one"), null, null);
 
         assertThatThrownBy(() -> paymentService.createPayment(
-                new PaymentRequest(reservationId, 12_000, "EUR", "pm-two"), null, null))
-                .isInstanceOf(ConflictException.class);
-    }
-
-    @Test
-    void staleRecoveryKeepsAnUnknownProviderOutcomeNonTerminal() {
-        UUID paymentId = UUID.randomUUID();
-        UUID reservationId = UUID.randomUUID();
-        paymentRepository.insertPayment(
-                paymentId,
-                reservationId,
-                10_000,
-                "EUR",
-                "fingerprint",
-                PaymentStatus.PROCESSING,
-                null);
-
-        paymentRepository.markStalePaymentsUnknown(Duration.ZERO);
-
-        assertThat(jdbc.queryForObject(
-                "select status from payment.payments where id = ?",
-                String.class,
-                paymentId)).isEqualTo("UNKNOWN");
-        assertThat(paymentService.getPayment(reservationId).status()).isEqualTo(PaymentStatus.PROCESSING);
-    }
-
-    @Test
-    void staleCancellationAlsoKeepsTheProviderOutcomeNonTerminal() {
-        UUID paymentId = UUID.randomUUID();
-        UUID reservationId = UUID.randomUUID();
-        paymentRepository.insertPayment(
-                paymentId,
-                reservationId,
-                10_000,
-                "EUR",
-                "fingerprint",
-                PaymentStatus.PROCESSING,
-                null);
-        paymentRepository.markCancellationPending(paymentId);
-
-        paymentRepository.markStalePaymentsUnknown(Duration.ZERO);
-
-        assertThat(jdbc.queryForObject(
-                "select status from payment.payments where id = ?",
-                String.class,
-                paymentId)).isEqualTo("UNKNOWN");
-        assertThat(paymentService.getPayment(reservationId).status()).isEqualTo(PaymentStatus.PROCESSING);
-    }
-
-    @Test
-    void idempotentPaymentRequestDoesNotPostponeStaleRecovery() {
-        UUID reservationId = UUID.randomUUID();
-        paymentRepository.insertPayment(
-                UUID.randomUUID(),
-                reservationId,
-                10_000,
-                "EUR",
-                "fingerprint",
-                PaymentStatus.PROCESSING,
-                null);
-        jdbc.update(
-                "update payment.payments set updated_at = now() - interval '10 minutes' "
-                        + "where reservation_id = ?",
-                reservationId);
-
-        paymentTransactions.startPayment(
-                new PaymentRequest(reservationId, 10_000, "EUR", "pm-test"),
-                "fingerprint");
-
-        assertThat(paymentRepository.markStalePaymentsUnknown(Duration.ofMinutes(2)))
-                .isEqualTo(1);
-        assertThat(paymentService.getPayment(reservationId).status())
-                .isEqualTo(PaymentStatus.PROCESSING);
+                new PaymentRequest(reservationId, 12_000, "USD", "pm-two"), null, null))
+                .isInstanceOf(ConflictException.class)
+                .hasMessageContaining("different payment details");
     }
 
     @Test
@@ -213,8 +272,10 @@ class PaymentServiceIntegrationTest {
                 RefundStatus.SUCCEEDED);
 
         assertThat(lateCompletion.status()).isEqualTo(RefundStatus.FAILED);
-        assertThat(paymentService.getPayment(reservationId).status())
-                .isEqualTo(PaymentStatus.SUCCEEDED);
+        assertThat(jdbc.queryForObject(
+                "select status from payment.payments where reservation_id = ?",
+                String.class,
+                reservationId)).isEqualTo("SUCCEEDED");
     }
 
     @Test
@@ -240,128 +301,6 @@ class PaymentServiceIntegrationTest {
         assertThat(paymentRepository.findRefundByReservationId(reservationId))
                 .get()
                 .satisfies(refund -> assertThat(refund.status()).isEqualTo(RefundStatus.FAILED));
-    }
-
-    @Test
-    void cancellationTombstoneRejectsALatePaymentRequest() {
-        UUID reservationId = UUID.randomUUID();
-
-        PaymentCancellationResponse cancellation = paymentService.cancelPayment(
-                new PaymentCancellationRequest(reservationId),
-                null,
-                null);
-
-        assertThat(cancellation.reservationId()).isEqualTo(reservationId);
-        assertThat(cancellation.payment()).isNull();
-        assertThat(jdbc.queryForObject(
-                "select status from payment.payments where reservation_id = ?",
-                String.class,
-                reservationId)).isEqualTo("CANCELLED");
-        assertThat(jdbc.queryForObject(
-                "select amount from payment.payments where reservation_id = ?",
-                Long.class,
-                reservationId)).isNull();
-        assertThatThrownBy(() -> paymentService.getPayment(reservationId))
-                .isInstanceOf(NotFoundException.class);
-        assertThatThrownBy(() -> paymentService.createPayment(
-                new PaymentRequest(reservationId, 10_000, "EUR", "pm-late"),
-                null,
-                null))
-                .isInstanceOf(ConflictException.class)
-                .hasMessageContaining("cancelled");
-        assertThat(jdbc.queryForObject(
-                "select count(*) from payment.payments where reservation_id = ?",
-                Integer.class,
-                reservationId)).isEqualTo(1);
-    }
-
-    @Test
-    void cancellationPreventsAProcessingPaymentFromCompletingLate() {
-        UUID paymentId = UUID.randomUUID();
-        UUID reservationId = UUID.randomUUID();
-        paymentRepository.insertPayment(
-                paymentId,
-                reservationId,
-                10_000,
-                "EUR",
-                "fingerprint",
-                PaymentStatus.PROCESSING,
-                null);
-
-        PaymentCancellationResponse cancellation = paymentService.cancelPayment(
-                new PaymentCancellationRequest(reservationId),
-                null,
-                null);
-        var lateCompletion = paymentRepository.completeProcessingPayment(
-                paymentId,
-                PaymentStatus.SUCCEEDED,
-                null);
-
-        assertThat(cancellation.payment()).isNotNull();
-        assertThat(cancellation.payment().status()).isEqualTo(PaymentStatus.FAILED);
-        assertThat(lateCompletion.status()).isEqualTo(PaymentStatus.CANCELLED);
-        assertThat(paymentService.getPayment(reservationId).status()).isEqualTo(PaymentStatus.FAILED);
-    }
-
-    @Test
-    void cancellationDelayHappensAfterPendingStateIsCommitted() throws Exception {
-        UUID paymentId = UUID.randomUUID();
-        UUID reservationId = UUID.randomUUID();
-        paymentRepository.insertPayment(
-                paymentId,
-                reservationId,
-                10_000,
-                "EUR",
-                "fingerprint",
-                PaymentStatus.PROCESSING,
-                null);
-
-        ExecutorService executor = Executors.newSingleThreadExecutor();
-        try {
-            Future<PaymentCancellationResponse> future = executor.submit(
-                    () -> paymentService.cancelPayment(
-                            new PaymentCancellationRequest(reservationId),
-                            1_000L,
-                            null));
-
-            awaitPaymentStatus(reservationId, PaymentStatus.CANCELLATION_PENDING);
-            assertThat(paymentService.getPayment(reservationId).status())
-                    .isEqualTo(PaymentStatus.PROCESSING);
-
-            PaymentCancellationResponse completed = future.get();
-            assertThat(completed.payment().status()).isEqualTo(PaymentStatus.FAILED);
-            assertThat(jdbc.queryForObject(
-                    "select status from payment.payments where reservation_id = ?",
-                    String.class,
-                    reservationId)).isEqualTo("CANCELLED");
-        } finally {
-            executor.shutdownNow();
-        }
-    }
-
-    @Test
-    void failedCancellationRecordsPaymentThatWonTheRace() {
-        UUID paymentId = UUID.randomUUID();
-        UUID reservationId = UUID.randomUUID();
-        paymentRepository.insertPayment(
-                paymentId,
-                reservationId,
-                10_000,
-                "EUR",
-                "fingerprint",
-                PaymentStatus.PROCESSING,
-                null);
-
-        PaymentCancellationResponse cancellation = paymentService.cancelPayment(
-                new PaymentCancellationRequest(reservationId),
-                null,
-                "true");
-
-        assertThat(cancellation.payment().status()).isEqualTo(PaymentStatus.SUCCEEDED);
-        assertThat(jdbc.queryForObject(
-                "select status from payment.payments where reservation_id = ?",
-                String.class,
-                reservationId)).isEqualTo("SUCCEEDED");
     }
 
     @Test
@@ -395,14 +334,15 @@ class PaymentServiceIntegrationTest {
                 processingReservationId,
                 10_000,
                 "EUR",
-                "fingerprint",
+                "pm-processing",
+                "token-digest",
                 PaymentStatus.PROCESSING,
                 null);
 
-        assertThatThrownBy(() -> paymentService.refund(
+        assertThatThrownBy(() -> paymentService.createRefund(
                 new RefundRequest(failedReservationId), null, null))
                 .isInstanceOf(ConflictException.class);
-        assertThatThrownBy(() -> paymentService.refund(
+        assertThatThrownBy(() -> paymentService.createRefund(
                 new RefundRequest(processingReservationId), null, null))
                 .isInstanceOf(ConflictException.class);
     }
@@ -417,19 +357,23 @@ class PaymentServiceIntegrationTest {
 
         ExecutorService executor = Executors.newSingleThreadExecutor();
         try {
-            Future<RefundResponse> future = executor.submit(() -> paymentService.refund(
+            Future<RefundResponse> future = executor.submit(() -> paymentService.createRefund(
                     new RefundRequest(reservationId),
                     1_000L,
                     null));
 
             awaitRefundStatus(reservationId, RefundStatus.PROCESSING);
-            assertThat(paymentService.getPayment(reservationId).status())
-                    .isEqualTo(PaymentStatus.SUCCEEDED);
+            assertThat(jdbc.queryForObject(
+                    "select status from payment.payments where reservation_id = ?",
+                    String.class,
+                    reservationId)).isEqualTo("SUCCEEDED");
 
             RefundResponse completed = future.get();
             assertThat(completed.status()).isEqualTo(RefundStatus.SUCCEEDED);
-            assertThat(paymentService.getPayment(reservationId).status())
-                    .isEqualTo(PaymentStatus.REFUNDED);
+            assertThat(jdbc.queryForObject(
+                    "select status from payment.payments where reservation_id = ?",
+                    String.class,
+                    reservationId)).isEqualTo("REFUNDED");
         } finally {
             executor.shutdownNow();
         }
@@ -443,18 +387,20 @@ class PaymentServiceIntegrationTest {
                 null,
                 null);
 
-        RefundResponse failed = paymentService.refund(
+        RefundResponse failed = paymentService.createRefund(
                 new RefundRequest(reservationId),
                 null,
                 "true");
-        RefundResponse repeated = paymentService.refund(
+        RefundResponse repeated = paymentService.createRefund(
                 new RefundRequest(reservationId), null, null);
 
         assertThat(failed.status()).isEqualTo(RefundStatus.FAILED);
         assertThat(repeated.refundId()).isEqualTo(failed.refundId());
         assertThat(repeated.status()).isEqualTo(RefundStatus.SUCCEEDED);
-        assertThat(paymentService.getPayment(reservationId).status())
-                .isEqualTo(PaymentStatus.REFUNDED);
+        assertThat(jdbc.queryForObject(
+                "select status from payment.payments where reservation_id = ?",
+                String.class,
+                reservationId)).isEqualTo("REFUNDED");
     }
 
     @Test
@@ -464,7 +410,7 @@ class PaymentServiceIntegrationTest {
                 new PaymentRequest(reservationId, 10_000, "EUR", "pm-refund"),
                 null,
                 null);
-        RefundResponse failed = paymentService.refund(
+        RefundResponse failed = paymentService.createRefund(
                 new RefundRequest(reservationId),
                 null,
                 "true");
@@ -473,7 +419,7 @@ class PaymentServiceIntegrationTest {
         Callable<RefundResponse> retry = () -> {
             ready.countDown();
             start.await();
-            return paymentService.refund(new RefundRequest(reservationId), 250L, null);
+            return paymentService.createRefund(new RefundRequest(reservationId), 250L, null);
         };
 
         ExecutorService executor = Executors.newFixedThreadPool(2);
@@ -510,14 +456,14 @@ class PaymentServiceIntegrationTest {
                 new PaymentRequest(reservationId, 10_000, "EUR", "pm-refund"),
                 null,
                 null);
-        RefundResponse failed = paymentService.refund(
+        RefundResponse failed = paymentService.createRefund(
                 new RefundRequest(reservationId),
                 null,
                 "true");
 
         ExecutorService executor = Executors.newSingleThreadExecutor();
         try {
-            Future<RefundResponse> retry = executor.submit(() -> paymentService.refund(
+            Future<RefundResponse> retry = executor.submit(() -> paymentService.createRefund(
                     new RefundRequest(reservationId),
                     1_000L,
                     null));
@@ -545,7 +491,7 @@ class PaymentServiceIntegrationTest {
                 null,
                 null);
 
-        assertThatThrownBy(() -> paymentService.refund(
+        assertThatThrownBy(() -> paymentService.createRefund(
                 new RefundRequest(reservationId),
                 PaymentService.MAX_SIMULATED_DELAY_MS + 1,
                 null))
@@ -573,22 +519,35 @@ class PaymentServiceIntegrationTest {
         throw new AssertionError("Refund did not reach " + expectedStatus);
     }
 
-    private void awaitPaymentStatus(
+    private void awaitPaymentAttempt(
             UUID reservationId,
+            int expectedAttempt,
             PaymentStatus expectedStatus
     ) throws InterruptedException {
         long deadline = System.nanoTime() + Duration.ofSeconds(5).toNanos();
         while (System.nanoTime() < deadline) {
-            List<String> statuses = jdbc.queryForList(
-                    "select status from payment.payments where reservation_id = ?",
-                    String.class,
-                    reservationId);
-            if (statuses.contains(expectedStatus.name())) {
+            List<Integer> attempts = jdbc.queryForList(
+                    "select attempt from payment.payments where reservation_id = ? and status = ?",
+                    Integer.class,
+                    reservationId,
+                    expectedStatus.name());
+            if (attempts.contains(expectedAttempt)) {
                 return;
             }
             Thread.sleep(20);
         }
-        throw new AssertionError("Payment did not reach " + expectedStatus);
+        throw new AssertionError(
+                "Payment did not reach attempt " + expectedAttempt + " in " + expectedStatus);
+    }
+
+    private String tokenDigest(String paymentMethodToken) {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            return HexFormat.of().formatHex(
+                    digest.digest(paymentMethodToken.getBytes(StandardCharsets.UTF_8)));
+        } catch (NoSuchAlgorithmException exception) {
+            throw new IllegalStateException("SHA-256 is not available", exception);
+        }
     }
 
     private void awaitRefundAttempt(

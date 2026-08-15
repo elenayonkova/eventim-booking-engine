@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-required_tools=(docker kubectl kind ytt kbld kapp kctrl)
+required_tools=(docker kubectl kind ytt kbld kapp kctrl jq)
 cluster_name="${CLUSTER_NAME:-eventim}"
 kind_context="kind-${cluster_name}"
 booking_image="eventim/booking-service:dev"
 payment_image="eventim/payment-service:dev"
-package_file="$(mktemp /tmp/eventim-package.XXXXXX.yml)"
-rendered_workloads_file="$(mktemp /tmp/eventim-workloads.XXXXXX.yml)"
+package_file="$(mktemp /tmp/eventim-package.XXXXXX)"
+rendered_workloads_file="$(mktemp /tmp/eventim-workloads.XXXXXX)"
 
 cleanup() {
   rm -f "${package_file}" "${rendered_workloads_file}"
@@ -49,8 +49,26 @@ ytt -f packages/eventim-booking-engine/config \
   | kbld -f packages/eventim-booking-engine/kbld.yml -f - \
   >"${rendered_workloads_file}"
 
-resolved_booking_image="$(awk '/image: kbld:eventim-booking-service-sha256-/ { print $2; exit }' "${rendered_workloads_file}")"
-resolved_payment_image="$(awk '/image: kbld:eventim-payment-service-sha256-/ { print $2; exit }' "${rendered_workloads_file}")"
+deployment_image() {
+  local deployment_name="$1"
+  local container_name="$2"
+
+  ytt -f "${rendered_workloads_file}" -o json \
+    | jq --slurp --raw-output \
+      --arg deployment "${deployment_name}" \
+      --arg container "${container_name}" \
+      'first(
+        .[]
+        | select(.apiVersion == "apps/v1" and .kind == "Deployment")
+        | select(.metadata.name == $deployment)
+        | .spec.template.spec.containers[]
+        | select(.name == $container)
+        | .image
+      ) // empty'
+}
+
+resolved_booking_image="$(deployment_image booking-service booking-service)"
+resolved_payment_image="$(deployment_image payment-service payment-service)"
 
 if [[ -z "${resolved_booking_image}" || -z "${resolved_payment_image}" ]]; then
   echo "kbld did not produce resolved application image references." >&2

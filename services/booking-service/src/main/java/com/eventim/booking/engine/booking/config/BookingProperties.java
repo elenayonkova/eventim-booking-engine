@@ -6,7 +6,7 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
 
 /**
  * Typed booking and payment-integration settings, including safe local defaults
- * for hold duration, reconciliation timeout, and HTTP connectivity.
+ * for hold duration and HTTP connectivity.
  */
 @ConfigurationProperties(prefix = "booking")
 public record BookingProperties(
@@ -14,6 +14,13 @@ public record BookingProperties(
         String paymentBaseUrl,
         Duration paymentConnectTimeout,
         Duration paymentReadTimeout,
-        Duration paymentPendingTimeout
+        Duration paymentMissingTimeout
 ) {
+
+    public BookingProperties {
+        if (paymentMissingTimeout.compareTo(paymentReadTimeout) <= 0) {
+            throw new IllegalArgumentException(
+                    "Payment missing timeout must exceed the payment read timeout");
+        }
+    }
 }

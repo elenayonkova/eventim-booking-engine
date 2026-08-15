@@ -4,15 +4,14 @@ import java.util.UUID;
 
 import org.springframework.stereotype.Component;
 
-import com.eventim.booking.engine.payment.api.PaymentCancellationRequest;
 import com.eventim.booking.engine.payment.api.PaymentRequest;
 import com.eventim.booking.engine.payment.api.RefundRequest;
 import com.eventim.booking.engine.payment.service.ConflictException;
 
 /**
  * In-process payment provider used by this sample application. It replaces
- * external charge, refund, and cancellation calls with configurable latency and
- * deterministic outcomes while preserving the real provider boundary.
+ * external charge and refund calls with configurable latency and deterministic
+ * outcomes while preserving the real provider boundary.
  */
 @Component
 public class SimulatedPaymentProvider implements PaymentProvider {
@@ -36,20 +35,6 @@ public class SimulatedPaymentProvider implements PaymentProvider {
     ) {
         simulateLatency(simulation);
         return operationOutcome(simulation);
-    }
-
-    @Override
-    public CancellationOutcome cancel(
-            UUID paymentId,
-            PaymentCancellationRequest request,
-            Simulation simulation
-    ) {
-        simulateLatency(simulation);
-        if (simulation.failureRequested()) {
-            // A failed cancellation means the original provider charge won the race.
-            return CancellationOutcome.PAYMENT_SUCCEEDED;
-        }
-        return CancellationOutcome.CANCELLED;
     }
 
     private OperationOutcome operationOutcome(Simulation simulation) {

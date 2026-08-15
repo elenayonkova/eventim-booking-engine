@@ -9,6 +9,7 @@ import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 
@@ -55,23 +56,6 @@ public class BookingRepository {
         }
     };
 
-    private static final RowMapper<ReservationRow> RESERVATION_ROW_MAPPER = new RowMapper<ReservationRow>() {
-        @Override
-        public ReservationRow mapRow(ResultSet rs, int rowNum) throws SQLException {
-            return new ReservationRow(
-                    rs.getObject("id", UUID.class),
-                    rs.getString("event_id"),
-                    ReservationStatus.valueOf(rs.getString("status")),
-                    rs.getObject("expires_at", OffsetDateTime.class),
-                    rs.getObject("payment_id", UUID.class),
-                    rs.getLong("checkout_amount"),
-                    rs.getString("checkout_currency"),
-                    rs.getString("payment_method_fingerprint"),
-                    rs.getObject("checkout_started_at", OffsetDateTime.class),
-                    rs.getString("payment_failure_reason"));
-        }
-    };
-
     private static final RowMapper<ReservationSeatRow> RESERVATION_SEAT_ROW_MAPPER =
             new RowMapper<ReservationSeatRow>() {
                 @Override
@@ -92,9 +76,23 @@ public class BookingRepository {
     };
 
     private final NamedParameterJdbcTemplate jdbc;
+    private final RowMapper<ReservationRow> reservationRowMapper;
 
     public BookingRepository(NamedParameterJdbcTemplate jdbc) {
         this.jdbc = jdbc;
+        this.reservationRowMapper = (rs, rowNum) -> {
+            UUID reservationId = rs.getObject("id", UUID.class);
+            return new ReservationRow(
+                    reservationId,
+                    rs.getString("event_id"),
+                    ReservationStatus.valueOf(rs.getString("status")),
+                    rs.getObject("expires_at", OffsetDateTime.class),
+                    rs.getObject("payment_id", UUID.class),
+                    rs.getLong("checkout_amount"),
+                    rs.getString("checkout_currency"),
+                    rs.getString("payment_method_token_digest"),
+                    rs.getString("payment_failure_reason"));
+        };
     }
 
     public void releaseExpiredHolds() {
@@ -156,19 +154,15 @@ public class BookingRepository {
         releaseHeldSeats(expiredReservationIds);
     }
 
-    public boolean eventExists(String eventId) {
-        Boolean exists = jdbc.queryForObject(
-                "select exists(select 1 from events where id = :eventId)",
-                Map.of("eventId", eventId),
-                Boolean.class);
-        return Boolean.TRUE.equals(exists);
-    }
-
-    private String findEventCurrency(String eventId) {
-        return jdbc.queryForObject(
-                "select currency from events where id = :eventId",
-                Map.of("eventId", eventId),
-                String.class);
+    public Optional<String> findEventCurrency(String eventId) {
+        try {
+            return Optional.ofNullable(jdbc.queryForObject(
+                    "select currency from events where id = :eventId",
+                    Map.of("eventId", eventId),
+                    String.class));
+        } catch (EmptyResultDataAccessException exception) {
+            return Optional.empty();
+        }
     }
 
     public List<SeatAvailabilityRow> findSeats(String eventId) {
@@ -184,10 +178,8 @@ public class BookingRepository {
     }
 
     public ReservationInsertResult createReservation(String eventId, List<String> requestedSeatLabels, Duration holdTtl) {
-        if (!eventExists(eventId)) {
-            throw new NotFoundException("Event not found: " + eventId);
-        }
-        String currency = findEventCurrency(eventId);
+        String currency = findEventCurrency(eventId)
+                .orElseThrow(() -> new NotFoundException("Event not found: " + eventId));
 
         List<String> sortedSeatLabels = normalizeSeatLabels(requestedSeatLabels);
         releaseExpiredHoldsForEvent(eventId);
@@ -311,15 +303,14 @@ public class BookingRepository {
                            payment_id,
                            checkout_amount,
                            checkout_currency,
-                           payment_method_fingerprint,
-                           checkout_started_at,
+                           payment_method_token_digest,
                            payment_failure_reason
                     from reservations
                     where id = :reservationId
                     for update
                     """,
                     Map.of("reservationId", reservationId),
-                    RESERVATION_ROW_MAPPER);
+                    reservationRowMapper);
         } catch (EmptyResultDataAccessException exception) {
             throw new NotFoundException("Reservation not found: " + reservationId);
         }
@@ -344,14 +335,14 @@ public class BookingRepository {
 
     public void markPaymentPending(
             UUID reservationId,
-            String paymentMethodFingerprint
+            String paymentMethodTokenDigest
     ) {
         int updated = jdbc.update(
                 """
                 update reservations
                 set status = 'PAYMENT_PENDING',
-                    payment_method_fingerprint = :paymentMethodFingerprint,
-                    checkout_started_at = now(),
+                    payment_method_token_digest = :paymentMethodTokenDigest,
+                    payment_started_at = now(),
                     payment_failure_reason = null,
                     updated_at = now()
                 where id = :reservationId
@@ -359,7 +350,7 @@ public class BookingRepository {
                 """,
                 new MapSqlParameterSource()
                         .addValue("reservationId", reservationId)
-                        .addValue("paymentMethodFingerprint", paymentMethodFingerprint));
+                        .addValue("paymentMethodTokenDigest", paymentMethodTokenDigest));
         requireSingleUpdate(updated, "Reservation could not enter payment processing: " + reservationId);
     }
 
@@ -397,18 +388,6 @@ public class BookingRepository {
         requireSingleUpdate(updated, "Reservation has a different processing payment: " + reservationId);
     }
 
-    public List<UUID> findPaymentPendingReservationIds() {
-        return jdbc.query(
-                """
-                select id
-                from reservations
-                where status = 'PAYMENT_PENDING'
-                order by updated_at, id
-                limit 100
-                """,
-                UUID_ROW_MAPPER);
-    }
-
     public List<UUID> findRefundRequiredReservationIds() {
         return jdbc.query(
                 """
@@ -418,6 +397,20 @@ public class BookingRepository {
                 order by updated_at, id
                 limit 100
                 """,
+                UUID_ROW_MAPPER);
+    }
+
+    public List<UUID> findPaymentPendingReservationIds(Duration missingTimeout) {
+        return jdbc.query(
+                """
+                select id
+                from reservations
+                where status = 'PAYMENT_PENDING'
+                  and payment_started_at <= now() - (:timeoutMillis * interval '1 millisecond')
+                order by updated_at, id
+                limit 100
+                """,
+                Map.of("timeoutMillis", missingTimeout.toMillis()),
                 UUID_ROW_MAPPER);
     }
 
@@ -460,11 +453,6 @@ public class BookingRepository {
     public void markRefundRequiredAndReleaseSeats(UUID reservationId, UUID paymentId, String reason) {
         markRefundRequired(reservationId, paymentId, reason);
         releaseHeldSeats(reservationId);
-    }
-
-    public void markRefundedAndReleaseSeats(UUID reservationId) {
-        releaseHeldSeats(reservationId);
-        markRefunded(reservationId);
     }
 
     public void markPaymentFailed(UUID reservationId, UUID paymentId, String failureReason) {
@@ -516,6 +504,49 @@ public class BookingRepository {
                 """,
                 Map.of("reservationId", reservationId));
         requireSingleUpdate(updated, "Reservation could not be marked refunded: " + reservationId);
+    }
+
+    public void markAlreadyRefundedAndReleaseSeats(
+            UUID reservationId,
+            UUID paymentId,
+            String reason
+    ) {
+        releaseHeldSeats(reservationId);
+        int updated = jdbc.update(
+                """
+                update reservations
+                set status = 'REFUNDED',
+                    payment_id = :paymentId,
+                    payment_failure_reason = :reason,
+                    updated_at = now()
+                where id = :reservationId
+                  and status = 'PAYMENT_PENDING'
+                  and (payment_id is null or payment_id = :paymentId)
+                """,
+                new MapSqlParameterSource()
+                        .addValue("reservationId", reservationId)
+                        .addValue("paymentId", paymentId)
+                        .addValue("reason", reason));
+        requireSingleUpdate(updated, "Reservation could not be marked refunded: " + reservationId);
+    }
+
+    public void expirePaymentPendingWithoutPayment(UUID reservationId) {
+        releaseHeldSeats(reservationId);
+        int updated = jdbc.update(
+                """
+                update reservations
+                set status = 'EXPIRED',
+                    payment_id = null,
+                    payment_method_token_digest = null,
+                    payment_started_at = null,
+                    payment_failure_reason = 'Payment was never created',
+                    updated_at = now()
+                where id = :reservationId
+                  and status = 'PAYMENT_PENDING'
+                  and payment_id is null
+                """,
+                Map.of("reservationId", reservationId));
+        requireSingleUpdate(updated, "Pending reservation could not be expired: " + reservationId);
     }
 
     public void expireHeldReservation(UUID reservationId) {

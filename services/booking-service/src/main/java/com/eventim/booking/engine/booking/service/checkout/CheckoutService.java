@@ -4,8 +4,8 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.HexFormat;
-import java.util.Optional;
 import java.util.UUID;
+import java.util.Optional;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -13,15 +13,14 @@ import org.springframework.stereotype.Service;
 
 import com.eventim.booking.engine.booking.api.CheckoutRequest;
 import com.eventim.booking.engine.booking.api.CheckoutResponse;
-import com.eventim.booking.engine.booking.config.BookingProperties;
 import com.eventim.booking.engine.booking.payment.ChargePayment;
-import com.eventim.booking.engine.booking.payment.PaymentCancellationResult;
 import com.eventim.booking.engine.booking.payment.PaymentGateway;
 import com.eventim.booking.engine.booking.payment.PaymentResult;
 import com.eventim.booking.engine.booking.payment.PaymentSimulation;
 import com.eventim.booking.engine.booking.payment.RefundResult;
 import com.eventim.booking.engine.booking.payment.RefundStatus;
 import com.eventim.booking.engine.booking.repository.BookingRepository;
+import com.eventim.booking.engine.booking.config.BookingProperties;
 import com.eventim.booking.engine.booking.service.ConflictException;
 import com.eventim.booking.engine.booking.service.ExternalServiceException;
 
@@ -35,23 +34,23 @@ public class CheckoutService {
     private static final Logger LOGGER = LoggerFactory.getLogger(CheckoutService.class);
 
     private final BookingRepository bookingRepository;
-    private final BookingProperties bookingProperties;
     private final PaymentGateway paymentGateway;
     private final ReservationCheckout reservationCheckout;
+    private final BookingProperties bookingProperties;
 
     public CheckoutService(
             BookingRepository bookingRepository,
-            BookingProperties bookingProperties,
             PaymentGateway paymentGateway,
-            ReservationCheckout reservationCheckout
+            ReservationCheckout reservationCheckout,
+            BookingProperties bookingProperties
     ) {
         this.bookingRepository = bookingRepository;
-        this.bookingProperties = bookingProperties;
         this.paymentGateway = paymentGateway;
         this.reservationCheckout = reservationCheckout;
+        this.bookingProperties = bookingProperties;
     }
 
-    public CheckoutResponse checkout(
+    public CheckoutResponse completeCheckout(
             CheckoutRequest request,
             Long simulatedDelayMs,
             String simulatedFailure
@@ -59,19 +58,12 @@ public class CheckoutService {
         PaymentSimulation simulation = new PaymentSimulation(simulatedDelayMs, simulatedFailure);
         CheckoutSnapshot checkout = reservationCheckout.beginCheckout(
                 request.reservationId(),
-                fingerprint(request.paymentMethodToken()));
+                tokenDigest(request.paymentMethodToken()));
 
         return continuePreparedCheckout(checkout, request, simulation);
     }
 
-    public void reconcilePendingPayments() {
-        for (UUID reservationId : bookingRepository.findPaymentPendingReservationIds()) {
-            try {
-                reconcilePendingPayment(reservationId);
-            } catch (RuntimeException exception) {
-                LOGGER.warn("Could not reconcile payment for reservation {}", reservationId, exception);
-            }
-        }
+    public void reconcileRequiredRefunds() {
         for (UUID reservationId : bookingRepository.findRefundRequiredReservationIds()) {
             try {
                 reconcileRequiredRefund(reservationId);
@@ -81,27 +73,30 @@ public class CheckoutService {
         }
     }
 
+    public void reconcilePendingPayments() {
+        for (UUID reservationId : bookingRepository.findPaymentPendingReservationIds(
+                bookingProperties.paymentMissingTimeout())) {
+            try {
+                reconcilePendingPayment(reservationId);
+            } catch (RuntimeException exception) {
+                LOGGER.warn("Could not reconcile payment for reservation {}", reservationId, exception);
+            }
+        }
+    }
+
     private CheckoutResponse continuePreparedCheckout(
             CheckoutSnapshot checkout,
             CheckoutRequest request,
             PaymentSimulation simulation
     ) {
-        switch (checkout.status()) {
-            case PAYMENT_PENDING:
-                return chargeAndApplyPayment(request, simulation, checkout);
-            case REFUND_REQUIRED:
-                return refundAndFinalize(checkout);
-            case BOOKED:
-            case PAYMENT_FAILED:
-            case REFUNDED:
-                return checkout.toResponse();
-            case EXPIRED:
-                throw reservationExpired(checkout.reservationId());
-            case HELD:
-            default:
-                throw new IllegalStateException(
-                        "Checkout preparation returned state " + checkout.status());
-        }
+        return switch (checkout.status()) {
+            case PAYMENT_PENDING -> chargeAndApplyPayment(request, simulation, checkout);
+            case REFUND_REQUIRED -> refundAndFinalize(checkout);
+            case BOOKED, PAYMENT_FAILED, REFUNDED -> checkout.toResponse();
+            case EXPIRED -> throw reservationExpired(checkout.reservationId());
+            case HELD -> throw new IllegalStateException(
+                    "Checkout preparation returned state " + checkout.status());
+        };
     }
 
     private CheckoutResponse chargeAndApplyPayment(
@@ -118,37 +113,6 @@ public class CheckoutService {
         return applyPaymentResult(checkout, payment);
     }
 
-    private void reconcilePendingPayment(UUID reservationId) {
-        CheckoutSnapshot checkout = reservationCheckout.loadPaymentPendingCheckout(reservationId);
-        if (checkout == null) {
-            return;
-        }
-
-        Optional<PaymentResult> payment = paymentGateway.find(reservationId);
-        if (payment.isPresent()) {
-            applyPaymentResult(checkout, payment.get());
-            return;
-        }
-
-        CheckoutSnapshot timedOutCheckout = reservationCheckout.loadTimedOutPaymentPendingCheckout(
-                reservationId,
-                bookingProperties.paymentPendingTimeout());
-        if (timedOutCheckout == null) {
-            return;
-        }
-
-        PaymentCancellationResult cancellation = paymentGateway.cancel(reservationId);
-        if (!reservationId.equals(cancellation.reservationId())) {
-            throw new ExternalServiceException("Payment service cancelled another reservation");
-        }
-        if (cancellation.payment() == null) {
-            reservationCheckout.failPaymentAfterCancellation(timedOutCheckout);
-            return;
-        }
-
-        applyPaymentResult(timedOutCheckout, cancellation.payment());
-    }
-
     private void reconcileRequiredRefund(UUID reservationId) {
         CheckoutSnapshot checkout = reservationCheckout.loadRefundRequiredCheckout(reservationId);
         if (checkout != null) {
@@ -156,25 +120,31 @@ public class CheckoutService {
         }
     }
 
+    private void reconcilePendingPayment(UUID reservationId) {
+        CheckoutSnapshot checkout = reservationCheckout.loadPaymentPendingCheckout(reservationId);
+        if (checkout == null) {
+            return;
+        }
+
+        Optional<PaymentResult> payment = paymentGateway.findPayment(reservationId);
+        if (payment.isEmpty()) {
+            reservationCheckout.expireMissingPayment(checkout);
+            return;
+        }
+        applyPaymentResult(checkout, payment.get());
+    }
+
     private CheckoutResponse applyPaymentResult(
             CheckoutSnapshot checkout,
             PaymentResult payment
     ) {
         CheckoutSnapshot updated = reservationCheckout.applyPaymentResult(checkout, payment);
-        switch (updated.status()) {
-            case REFUND_REQUIRED:
-                return refundAndFinalize(updated);
-            case PAYMENT_PENDING:
-            case BOOKED:
-            case PAYMENT_FAILED:
-            case REFUNDED:
-                return updated.toResponse();
-            case HELD:
-            case EXPIRED:
-            default:
-                throw new IllegalStateException(
-                        "Payment result produced state " + updated.status());
-        }
+        return switch (updated.status()) {
+            case REFUND_REQUIRED -> refundAndFinalize(updated);
+            case PAYMENT_PENDING, BOOKED, PAYMENT_FAILED, REFUNDED -> updated.toResponse();
+            case HELD, EXPIRED -> throw new IllegalStateException(
+                    "Payment result produced state " + updated.status());
+        };
     }
 
     private CheckoutResponse refundAndFinalize(CheckoutSnapshot checkout) {
@@ -190,7 +160,7 @@ public class CheckoutService {
         return new ConflictException("Reservation has expired: " + reservationId);
     }
 
-    private String fingerprint(String paymentMethodToken) {
+    private String tokenDigest(String paymentMethodToken) {
         try {
             MessageDigest digest = MessageDigest.getInstance("SHA-256");
             return HexFormat.of().formatHex(

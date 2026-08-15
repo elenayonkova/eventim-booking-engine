@@ -257,6 +257,8 @@ spec:
             #@ end
             - name: PAYMENT_RECOVERY_SWEEP_MS
               value: #@ str(data.values.payment.recoverySweepMs)
+            - name: PAYMENT_PROVIDER_ATTEMPT_TIMEOUT
+              value: #@ data.values.payment.providerAttemptTimeout
           startupProbe: #@ startup_probe()
           readinessProbe: #@ readiness_probe()
           livenessProbe: #@ liveness_probe()
@@ -343,10 +345,12 @@ spec:
               value: #@ data.values.booking.paymentConnectTimeout
             - name: PAYMENT_READ_TIMEOUT
               value: #@ data.values.booking.paymentReadTimeout
-            - name: PAYMENT_PENDING_TIMEOUT
-              value: #@ data.values.booking.paymentPendingTimeout
+            - name: PAYMENT_MISSING_TIMEOUT
+              value: #@ data.values.booking.paymentMissingTimeout
             - name: PAYMENT_RECONCILIATION_SWEEP_MS
               value: #@ str(data.values.booking.paymentReconciliationSweepMs)
+            - name: REFUND_RECONCILIATION_SWEEP_MS
+              value: #@ str(data.values.booking.refundReconciliationSweepMs)
           startupProbe: #@ startup_probe()
           readinessProbe: #@ readiness_probe()
           livenessProbe: #@ liveness_probe()

@@ -10,13 +10,13 @@ import java.time.OffsetDateTime;
 import java.util.ArrayList;
 import java.util.HexFormat;
 import java.util.List;
+import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
-import java.util.Optional;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -37,7 +37,6 @@ import com.eventim.booking.engine.booking.api.ReservationResponse;
 import com.eventim.booking.engine.booking.domain.ReservationStatus;
 import com.eventim.booking.engine.booking.payment.ChargePayment;
 import com.eventim.booking.engine.booking.payment.PaymentGateway;
-import com.eventim.booking.engine.booking.payment.PaymentCancellationResult;
 import com.eventim.booking.engine.booking.payment.PaymentResult;
 import com.eventim.booking.engine.booking.payment.PaymentSimulation;
 import com.eventim.booking.engine.booking.payment.PaymentStatus;
@@ -184,13 +183,13 @@ class BookingServiceIntegrationTest {
                         reservation.reservationId(),
                         10_000,
                         "EUR",
-                        fingerprint("pm-test"),
+                        tokenDigest("pm-test"),
                         PaymentStatus.SUCCEEDED,
                         null));
 
-        CheckoutResponse first = checkoutService.checkout(
+        CheckoutResponse first = checkoutService.completeCheckout(
                 new CheckoutRequest(reservation.reservationId(), "pm-test"), null, null);
-        CheckoutResponse second = checkoutService.checkout(
+        CheckoutResponse second = checkoutService.completeCheckout(
                 new CheckoutRequest(reservation.reservationId(), "pm-test"), null, null);
 
         assertThat(first.status()).isEqualTo(ReservationStatus.BOOKED);
@@ -226,11 +225,11 @@ class BookingServiceIntegrationTest {
                         reservation.reservationId(),
                         5_000,
                         "EUR",
-                        fingerprint("pm-snapshot"),
+                        tokenDigest("pm-snapshot"),
                         PaymentStatus.SUCCEEDED,
                         null));
 
-        CheckoutResponse checkout = checkoutService.checkout(
+        CheckoutResponse checkout = checkoutService.completeCheckout(
                 new CheckoutRequest(reservation.reservationId(), "pm-snapshot"),
                 null,
                 null);
@@ -256,13 +255,13 @@ class BookingServiceIntegrationTest {
                         reservation.reservationId(),
                         10_000,
                         "EUR",
-                        fingerprint("declined"),
+                        tokenDigest("declined"),
                         PaymentStatus.FAILED,
                         "Simulated payment failure"));
 
-        CheckoutResponse first = checkoutService.checkout(
+        CheckoutResponse first = checkoutService.completeCheckout(
                 new CheckoutRequest(reservation.reservationId(), "declined"), null, "true");
-        CheckoutResponse second = checkoutService.checkout(
+        CheckoutResponse second = checkoutService.completeCheckout(
                 new CheckoutRequest(reservation.reservationId(), "declined"), null, "true");
 
         assertThat(first.status()).isEqualTo(ReservationStatus.PAYMENT_FAILED);
@@ -280,7 +279,7 @@ class BookingServiceIntegrationTest {
     }
 
     @Test
-    void reconciliationCompletesAProcessingPaymentAfterTheClientDisconnects() {
+    void checkoutRetryCompletesAProcessingPaymentWithoutALookupEndpoint() {
         ReservationResponse reservation = bookingService.createReservation(
                 new CreateReservationRequest("event-1", List.of("A-1")));
         UUID paymentId = UUID.randomUUID();
@@ -289,8 +288,16 @@ class BookingServiceIntegrationTest {
                 reservation.reservationId(),
                 5_000,
                 "EUR",
-                fingerprint("slow-payment"),
+                tokenDigest("slow-payment"),
                 PaymentStatus.PROCESSING,
+                null);
+        PaymentResult succeeded = new PaymentResult(
+                paymentId,
+                reservation.reservationId(),
+                5_000,
+                "EUR",
+                tokenDigest("slow-payment"),
+                PaymentStatus.SUCCEEDED,
                 null);
         org.mockito.Mockito.when(paymentGateway.charge(new ChargePayment(
                         reservation.reservationId(),
@@ -299,21 +306,21 @@ class BookingServiceIntegrationTest {
                         "slow-payment",
                         new PaymentSimulation(20_000L, null))))
                 .thenReturn(processing);
-        org.mockito.Mockito.when(paymentGateway.find(reservation.reservationId()))
-                .thenReturn(Optional.of(new PaymentResult(
-                        paymentId,
+        org.mockito.Mockito.when(paymentGateway.charge(new ChargePayment(
                         reservation.reservationId(),
                         5_000,
                         "EUR",
-                        fingerprint("slow-payment"),
-                        PaymentStatus.SUCCEEDED,
-                        null)));
+                        "slow-payment",
+                        new PaymentSimulation(null, null))))
+                .thenReturn(succeeded);
 
-        CheckoutResponse pending = checkoutService.checkout(
+        CheckoutResponse pending = checkoutService.completeCheckout(
                 new CheckoutRequest(reservation.reservationId(), "slow-payment"), 20_000L, null);
-        checkoutService.reconcilePendingPayments();
+        CheckoutResponse completed = checkoutService.completeCheckout(
+                new CheckoutRequest(reservation.reservationId(), "slow-payment"), null, null);
 
         assertThat(pending.status()).isEqualTo(ReservationStatus.PAYMENT_PENDING);
+        assertThat(completed.status()).isEqualTo(ReservationStatus.BOOKED);
         assertThat(jdbc.queryForObject(
                 "select status from booking.reservations where id = ?",
                 String.class,
@@ -324,34 +331,121 @@ class BookingServiceIntegrationTest {
     }
 
     @Test
+    void clientRetryCompletesCheckoutAfterAnUnknownOutcome() {
+        ReservationResponse reservation = bookingService.createReservation(
+                new CreateReservationRequest("event-1", List.of("A-1")));
+        UUID paymentId = UUID.randomUUID();
+        ChargePayment command = new ChargePayment(
+                reservation.reservationId(),
+                5_000,
+                "EUR",
+                "pm-recovery",
+                new PaymentSimulation(null, null));
+        org.mockito.Mockito.when(paymentGateway.charge(command))
+                .thenThrow(new ExternalServiceException("Payment outcome is unknown"))
+                .thenReturn(new PaymentResult(
+                        paymentId,
+                        reservation.reservationId(),
+                        5_000,
+                        "EUR",
+                        tokenDigest("pm-recovery"),
+                        PaymentStatus.SUCCEEDED,
+                        null));
+
+        assertThatThrownBy(() -> checkoutService.completeCheckout(
+                new CheckoutRequest(reservation.reservationId(), "pm-recovery"),
+                null,
+                null))
+                .isInstanceOf(ExternalServiceException.class);
+        assertThat(jdbc.queryForObject(
+                "select status from booking.reservations where id = ?",
+                String.class,
+                reservation.reservationId())).isEqualTo("PAYMENT_PENDING");
+        CheckoutResponse completed = checkoutService.completeCheckout(
+                new CheckoutRequest(reservation.reservationId(), "pm-recovery"),
+                null,
+                null);
+
+        assertThat(completed.status()).isEqualTo(ReservationStatus.BOOKED);
+        assertThat(jdbc.queryForObject(
+                "select status from booking.reservations where id = ?",
+                String.class,
+                reservation.reservationId())).isEqualTo("BOOKED");
+        assertThat(jdbc.queryForObject(
+                "select status from booking.seats where seat_label = 'A-1'",
+                String.class)).isEqualTo("BOOKED");
+        org.mockito.Mockito.verify(paymentGateway, org.mockito.Mockito.times(2)).charge(command);
+    }
+
+    @Test
+    void reconciliationExpiresAReservationWhenNoPaymentWasCreated() {
+        ReservationResponse reservation = bookingService.createReservation(
+                new CreateReservationRequest("event-1", List.of("A-1")));
+        ChargePayment command = new ChargePayment(
+                reservation.reservationId(),
+                5_000,
+                "EUR",
+                "pm-never-created",
+                new PaymentSimulation(null, null));
+        org.mockito.Mockito.when(paymentGateway.charge(command))
+                .thenThrow(new ExternalServiceException("Payment service was unreachable"));
+
+        assertThatThrownBy(() -> checkoutService.completeCheckout(
+                new CheckoutRequest(reservation.reservationId(), "pm-never-created"),
+                null,
+                null))
+                .isInstanceOf(ExternalServiceException.class);
+        jdbc.update(
+                "update booking.reservations set payment_started_at = now() - interval '10 minutes' "
+                        + "where id = ?",
+                reservation.reservationId());
+        org.mockito.Mockito.when(paymentGateway.findPayment(reservation.reservationId()))
+                .thenReturn(Optional.empty());
+
+        checkoutService.reconcilePendingPayments();
+
+        assertThat(jdbc.queryForObject(
+                "select status from booking.reservations where id = ?",
+                String.class,
+                reservation.reservationId())).isEqualTo("EXPIRED");
+        assertThat(jdbc.queryForObject(
+                "select status from booking.seats where seat_label = 'A-1'",
+                String.class)).isEqualTo("AVAILABLE");
+        assertThat(jdbc.queryForObject(
+                "select count(*) from booking.reservation_seats where reservation_id = ?",
+                Integer.class,
+                reservation.reservationId())).isEqualTo(1);
+    }
+
+    @Test
     void reconciliationRefundsSuccessfulPaymentWithMismatchedPayload() {
         ReservationResponse reservation = bookingService.createReservation(
                 new CreateReservationRequest("event-1", List.of("A-1")));
         UUID paymentId = UUID.randomUUID();
 
+        PaymentResult processing = new PaymentResult(
+                paymentId,
+                reservation.reservationId(),
+                5_000,
+                "EUR",
+                tokenDigest("pm-original"),
+                PaymentStatus.PROCESSING,
+                null);
+        PaymentResult mismatched = new PaymentResult(
+                paymentId,
+                reservation.reservationId(),
+                1,
+                "EUR",
+                tokenDigest("pm-other"),
+                PaymentStatus.SUCCEEDED,
+                null);
         org.mockito.Mockito.when(paymentGateway.charge(new ChargePayment(
                         reservation.reservationId(),
                         5_000,
                         "EUR",
                         "pm-original",
                         new PaymentSimulation(null, null))))
-                .thenReturn(new PaymentResult(
-                        paymentId,
-                        reservation.reservationId(),
-                        5_000,
-                        "EUR",
-                        fingerprint("pm-original"),
-                        PaymentStatus.PROCESSING,
-                        null));
-        org.mockito.Mockito.when(paymentGateway.find(reservation.reservationId()))
-                .thenReturn(Optional.of(new PaymentResult(
-                        paymentId,
-                        reservation.reservationId(),
-                        1,
-                        "EUR",
-                        fingerprint("pm-other"),
-                        PaymentStatus.SUCCEEDED,
-                        null)));
+                .thenReturn(processing, mismatched);
         org.mockito.Mockito.when(paymentGateway.refund(reservation.reservationId()))
                 .thenThrow(new ExternalServiceException("Temporary refund failure"))
                 .thenReturn(new RefundResult(
@@ -360,9 +454,13 @@ class BookingServiceIntegrationTest {
                         paymentId,
                         RefundStatus.SUCCEEDED));
 
-        checkoutService.checkout(
+        CheckoutResponse pending = checkoutService.completeCheckout(
                 new CheckoutRequest(reservation.reservationId(), "pm-original"), null, null);
-        checkoutService.reconcilePendingPayments();
+        assertThat(pending.status()).isEqualTo(ReservationStatus.PAYMENT_PENDING);
+        assertThatThrownBy(() -> checkoutService.completeCheckout(
+                new CheckoutRequest(reservation.reservationId(), "pm-original"), null, null))
+                .isInstanceOf(ExternalServiceException.class);
+        checkoutService.reconcileRequiredRefunds();
 
         assertThat(jdbc.queryForObject(
                 "select status from booking.reservations where id = ?",
@@ -407,7 +505,7 @@ class BookingServiceIntegrationTest {
         ReservationResponse reservation = bookingService.createReservation(
                 new CreateReservationRequest("event-1", List.of("A-1")));
 
-        assertThatThrownBy(() -> checkoutService.checkout(
+        assertThatThrownBy(() -> checkoutService.completeCheckout(
                 new CheckoutRequest(reservation.reservationId(), "pm-test"),
                 PaymentSimulation.MAX_DELAY_MS + 1,
                 null))
@@ -430,7 +528,7 @@ class BookingServiceIntegrationTest {
                 OffsetDateTime.now().minusMinutes(1),
                 reservation.reservationId());
 
-        assertThatThrownBy(() -> checkoutService.checkout(
+        assertThatThrownBy(() -> checkoutService.completeCheckout(
                 new CheckoutRequest(reservation.reservationId(), "pm-test"), null, null))
                 .isInstanceOf(ConflictException.class)
                 .hasMessageContaining("Reservation has expired");
@@ -461,13 +559,13 @@ class BookingServiceIntegrationTest {
                         reservation.reservationId(),
                         5_000,
                         "EUR",
-                        fingerprint("already-refunded"),
+                        tokenDigest("already-refunded"),
                         PaymentStatus.REFUNDED,
                         null));
 
-        CheckoutResponse first = checkoutService.checkout(
+        CheckoutResponse first = checkoutService.completeCheckout(
                 new CheckoutRequest(reservation.reservationId(), "already-refunded"), null, null);
-        CheckoutResponse second = checkoutService.checkout(
+        CheckoutResponse second = checkoutService.completeCheckout(
                 new CheckoutRequest(reservation.reservationId(), "already-refunded"), null, null);
 
         assertThat(first.status()).isEqualTo(ReservationStatus.REFUNDED);
@@ -484,101 +582,6 @@ class BookingServiceIntegrationTest {
                         new PaymentSimulation(null, null)));
         org.mockito.Mockito.verify(paymentGateway, org.mockito.Mockito.never())
                 .refund(reservation.reservationId());
-    }
-
-    @Test
-    void abandonedPendingPaymentTimesOutAndReleasesSeat() {
-        ReservationResponse reservation = bookingService.createReservation(
-                new CreateReservationRequest("event-1", List.of("A-1")));
-        UUID paymentId = UUID.randomUUID();
-        org.mockito.Mockito.when(paymentGateway.charge(new ChargePayment(
-                        reservation.reservationId(),
-                        5_000,
-                        "EUR",
-                        "lost-payment",
-                        new PaymentSimulation(null, null))))
-                .thenReturn(new PaymentResult(
-                        paymentId,
-                        reservation.reservationId(),
-                        5_000,
-                        "EUR",
-                        fingerprint("lost-payment"),
-                        PaymentStatus.PROCESSING,
-                        null));
-        org.mockito.Mockito.when(paymentGateway.find(reservation.reservationId()))
-                .thenReturn(Optional.empty());
-        org.mockito.Mockito.when(paymentGateway.cancel(reservation.reservationId()))
-                .thenReturn(new PaymentCancellationResult(reservation.reservationId(), null));
-
-        CheckoutResponse pending = checkoutService.checkout(
-                new CheckoutRequest(reservation.reservationId(), "lost-payment"), null, null);
-        jdbc.update(
-                "update booking.reservations set checkout_started_at = ? where id = ?",
-                OffsetDateTime.now().minusMinutes(10),
-                reservation.reservationId());
-
-        checkoutService.reconcilePendingPayments();
-
-        assertThat(pending.status()).isEqualTo(ReservationStatus.PAYMENT_PENDING);
-        assertThat(jdbc.queryForObject(
-                "select status from booking.reservations where id = ?",
-                String.class,
-                reservation.reservationId())).isEqualTo("PAYMENT_FAILED");
-        assertThat(jdbc.queryForObject(
-                "select status from booking.seats where seat_label = 'A-1'",
-                String.class)).isEqualTo("AVAILABLE");
-        org.mockito.Mockito.verify(paymentGateway).cancel(reservation.reservationId());
-    }
-
-    @Test
-    void reconciliationAppliesAPaymentThatWinsTheTimeoutCancellationRace() {
-        ReservationResponse reservation = bookingService.createReservation(
-                new CreateReservationRequest("event-1", List.of("A-1")));
-        UUID paymentId = UUID.randomUUID();
-        PaymentResult processing = new PaymentResult(
-                paymentId,
-                reservation.reservationId(),
-                5_000,
-                "EUR",
-                fingerprint("racing-payment"),
-                PaymentStatus.PROCESSING,
-                null);
-        PaymentResult succeeded = new PaymentResult(
-                paymentId,
-                reservation.reservationId(),
-                5_000,
-                "EUR",
-                fingerprint("racing-payment"),
-                PaymentStatus.SUCCEEDED,
-                null);
-        org.mockito.Mockito.when(paymentGateway.charge(new ChargePayment(
-                        reservation.reservationId(),
-                        5_000,
-                        "EUR",
-                        "racing-payment",
-                        new PaymentSimulation(null, null))))
-                .thenReturn(processing);
-        org.mockito.Mockito.when(paymentGateway.find(reservation.reservationId()))
-                .thenReturn(Optional.empty());
-        org.mockito.Mockito.when(paymentGateway.cancel(reservation.reservationId()))
-                .thenReturn(new PaymentCancellationResult(reservation.reservationId(), succeeded));
-
-        checkoutService.checkout(
-                new CheckoutRequest(reservation.reservationId(), "racing-payment"), null, null);
-        jdbc.update(
-                "update booking.reservations set checkout_started_at = ? where id = ?",
-                OffsetDateTime.now().minusMinutes(10),
-                reservation.reservationId());
-
-        checkoutService.reconcilePendingPayments();
-
-        assertThat(jdbc.queryForObject(
-                "select status from booking.reservations where id = ?",
-                String.class,
-                reservation.reservationId())).isEqualTo("BOOKED");
-        assertThat(jdbc.queryForObject(
-                "select status from booking.seats where seat_label = 'A-1'",
-                String.class)).isEqualTo("BOOKED");
     }
 
     private void assertInvalidRefundLeavesRecoveryPending(
@@ -598,13 +601,13 @@ class BookingServiceIntegrationTest {
                         reservation.reservationId(),
                         1,
                         "EUR",
-                        fingerprint("refund-validation"),
+                        tokenDigest("refund-validation"),
                         PaymentStatus.SUCCEEDED,
                         null));
         org.mockito.Mockito.when(paymentGateway.refund(reservation.reservationId()))
                 .thenReturn(invalidRefund.apply(reservation.reservationId(), paymentId));
 
-        assertThatThrownBy(() -> checkoutService.checkout(
+        assertThatThrownBy(() -> checkoutService.completeCheckout(
                 new CheckoutRequest(reservation.reservationId(), "refund-validation"),
                 null,
                 null))
@@ -619,7 +622,7 @@ class BookingServiceIntegrationTest {
                 String.class)).isEqualTo("AVAILABLE");
     }
 
-    private String fingerprint(String paymentMethodToken) {
+    private String tokenDigest(String paymentMethodToken) {
         try {
             MessageDigest digest = MessageDigest.getInstance("SHA-256");
             return HexFormat.of().formatHex(

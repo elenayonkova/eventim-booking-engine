@@ -18,15 +18,16 @@ booking:
   expiry-sweep-ms: ${BOOKING_EXPIRY_SWEEP_MS:30000}
   payment-base-url: ${PAYMENT_BASE_URL:http://localhost:8081}
   payment-connect-timeout: ${PAYMENT_CONNECT_TIMEOUT:2s}
-  payment-read-timeout: ${PAYMENT_READ_TIMEOUT:10s}
-  payment-pending-timeout: ${PAYMENT_PENDING_TIMEOUT:3m}
+  payment-read-timeout: ${PAYMENT_READ_TIMEOUT:65s}
+  payment-missing-timeout: ${PAYMENT_MISSING_TIMEOUT:90s}
   payment-reconciliation-sweep-ms: ${PAYMENT_RECONCILIATION_SWEEP_MS:30000}
+  refund-reconciliation-sweep-ms: ${REFUND_RECONCILIATION_SWEEP_MS:30000}
 
 management:
   endpoints:
     web:
       exposure:
-        include: health,info
+        include: health,info,metrics
   endpoint:
     health:
       probes:

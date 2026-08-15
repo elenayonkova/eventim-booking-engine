@@ -1,5 +1,5 @@
 create table events (
-    id text primary key,
+    id varchar(100) primary key,
     name text not null,
     currency char(3) not null,
     created_at timestamptz not null default now()
@@ -7,7 +7,7 @@ create table events (
 
 create table reservations (
     id uuid primary key,
-    event_id text not null references events(id),
+    event_id varchar(100) not null references events(id),
     status text not null check (
         status in (
             'HELD',
@@ -23,30 +23,36 @@ create table reservations (
     payment_id uuid,
     checkout_amount bigint not null check (checkout_amount > 0),
     checkout_currency char(3) not null,
-    payment_method_fingerprint text,
-    checkout_started_at timestamptz,
+    payment_method_token_digest varchar(64),
+    payment_started_at timestamptz,
     payment_failure_reason text,
     created_at timestamptz not null default now(),
     updated_at timestamptz not null default now(),
     constraint chk_reservation_checkout_state check (
         (
             status in ('HELD', 'EXPIRED')
-            and payment_method_fingerprint is null
-            and checkout_started_at is null
+            and payment_method_token_digest is null
+            and payment_started_at is null
         )
         or
         (
-            status in ('PAYMENT_PENDING', 'BOOKED', 'PAYMENT_FAILED', 'REFUND_REQUIRED', 'REFUNDED')
-            and payment_method_fingerprint is not null
-            and checkout_started_at is not null
+            status = 'PAYMENT_PENDING'
+            and payment_method_token_digest is not null
+            and payment_started_at is not null
+        )
+        or
+        (
+            status in ('BOOKED', 'PAYMENT_FAILED', 'REFUND_REQUIRED', 'REFUNDED')
+            and payment_method_token_digest is not null
+            and payment_started_at is not null
         )
     )
 );
 
 create table seats (
     id uuid primary key,
-    event_id text not null references events(id),
-    seat_label text not null,
+    event_id varchar(100) not null references events(id),
+    seat_label varchar(100) not null,
     price_amount bigint not null check (price_amount > 0),
     status text not null check (status in ('AVAILABLE', 'HELD', 'BOOKED')),
     reservation_id uuid references reservations(id),
@@ -71,10 +77,6 @@ create index idx_seats_event_status on seats(event_id, status);
 create index idx_seats_reservation_id on seats(reservation_id);
 create index idx_reservations_status_expires_at on reservations(status, expires_at);
 create index idx_reservations_event_id on reservations(event_id);
-
-create index idx_reservations_payment_reconciliation
-    on reservations(updated_at, id)
-    where status = 'PAYMENT_PENDING';
 
 create index idx_reservations_refund_reconciliation
     on reservations(updated_at, id)

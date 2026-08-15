@@ -4,20 +4,26 @@ import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
 /**
- * Schedules recovery of unresolved payment and refund work. The actual
- * reconciliation workflow is delegated to {@link CheckoutService}.
+ * Reconciles checkout work that outlived the initiating HTTP request. Missing
+ * payments expire and release their seats; durable payment and refund results
+ * are applied idempotently.
  */
 @Component
-public class PaymentReconciliationJob {
+public class CheckoutReconciliationJob {
 
     private final CheckoutService checkoutService;
 
-    public PaymentReconciliationJob(CheckoutService checkoutService) {
+    public CheckoutReconciliationJob(CheckoutService checkoutService) {
         this.checkoutService = checkoutService;
     }
 
     @Scheduled(fixedDelayString = "${booking.payment-reconciliation-sweep-ms}")
     public void reconcilePayments() {
         checkoutService.reconcilePendingPayments();
+    }
+
+    @Scheduled(fixedDelayString = "${booking.refund-reconciliation-sweep-ms}")
+    public void reconcileRefunds() {
+        checkoutService.reconcileRequiredRefunds();
     }
 }

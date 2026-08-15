@@ -25,6 +25,7 @@ services:
       SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/eventim?currentSchema=payment
       SPRING_DATASOURCE_USERNAME: eventim
       SPRING_DATASOURCE_PASSWORD: eventim
+      PAYMENT_PROVIDER_ATTEMPT_TIMEOUT: 90s
     ports:
       - "8081:8081"
     depends_on:
@@ -42,6 +43,7 @@ services:
       SPRING_DATASOURCE_USERNAME: eventim
       SPRING_DATASOURCE_PASSWORD: eventim
       PAYMENT_BASE_URL: http://payment-service:8081
+      PAYMENT_MISSING_TIMEOUT: 90s
     ports:
       - "8080:8080"
     depends_on:

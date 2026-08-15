@@ -15,13 +15,13 @@ spring:
 
 payment:
   recovery-sweep-ms: ${PAYMENT_RECOVERY_SWEEP_MS:30000}
-  simulation-enabled: ${PAYMENT_SIMULATION_ENABLED:true}
+  provider-attempt-timeout: ${PAYMENT_PROVIDER_ATTEMPT_TIMEOUT:90s}
 
 management:
   endpoints:
     web:
       exposure:
-        include: health,info
+        include: health,info,metrics
   endpoint:
     health:
       probes:
