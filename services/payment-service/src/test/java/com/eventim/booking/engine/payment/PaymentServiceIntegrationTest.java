@@ -123,7 +123,7 @@ class PaymentServiceIntegrationTest {
     }
 
     @Test
-    void staleRecoveryCannotBeOverwrittenByLatePaymentCompletion() {
+    void staleRecoveryKeepsAnUnknownProviderOutcomeNonTerminal() {
         UUID paymentId = UUID.randomUUID();
         UUID reservationId = UUID.randomUUID();
         paymentRepository.insertPayment(
@@ -135,14 +135,36 @@ class PaymentServiceIntegrationTest {
                 PaymentStatus.PROCESSING,
                 null);
 
-        paymentRepository.failStaleProcessingPayments(Duration.ZERO);
-        var result = paymentRepository.completeProcessingPayment(
-                paymentId,
-                PaymentStatus.SUCCEEDED,
-                null);
+        paymentRepository.markStalePaymentsUnknown(Duration.ZERO);
 
-        assertThat(result.status()).isEqualTo(PaymentStatus.FAILED);
-        assertThat(paymentService.getPayment(reservationId).status()).isEqualTo(PaymentStatus.FAILED);
+        assertThat(jdbc.queryForObject(
+                "select status from payment.payments where id = ?",
+                String.class,
+                paymentId)).isEqualTo("UNKNOWN");
+        assertThat(paymentService.getPayment(reservationId).status()).isEqualTo(PaymentStatus.PROCESSING);
+    }
+
+    @Test
+    void staleCancellationAlsoKeepsTheProviderOutcomeNonTerminal() {
+        UUID paymentId = UUID.randomUUID();
+        UUID reservationId = UUID.randomUUID();
+        paymentRepository.insertPayment(
+                paymentId,
+                reservationId,
+                10_000,
+                "EUR",
+                "fingerprint",
+                PaymentStatus.PROCESSING,
+                null);
+        paymentRepository.markCancellationPending(paymentId);
+
+        paymentRepository.markStalePaymentsUnknown(Duration.ZERO);
+
+        assertThat(jdbc.queryForObject(
+                "select status from payment.payments where id = ?",
+                String.class,
+                paymentId)).isEqualTo("UNKNOWN");
+        assertThat(paymentService.getPayment(reservationId).status()).isEqualTo(PaymentStatus.PROCESSING);
     }
 
     @Test
@@ -165,10 +187,10 @@ class PaymentServiceIntegrationTest {
                 new PaymentRequest(reservationId, 10_000, "EUR", "pm-test"),
                 "fingerprint");
 
-        assertThat(paymentRepository.failStaleProcessingPayments(Duration.ofMinutes(2)))
+        assertThat(paymentRepository.markStalePaymentsUnknown(Duration.ofMinutes(2)))
                 .isEqualTo(1);
         assertThat(paymentService.getPayment(reservationId).status())
-                .isEqualTo(PaymentStatus.FAILED);
+                .isEqualTo(PaymentStatus.PROCESSING);
     }
 
     @Test

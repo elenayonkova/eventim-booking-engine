@@ -202,7 +202,7 @@ public class BookingRepository {
                 from seats
                 where event_id = :eventId
                   and seat_label in (:seatLabels)
-                order by seat_label
+                order by id
                 for update
                 """,
                 selectParams,
@@ -373,6 +373,7 @@ public class BookingRepository {
                     updated_at = now()
                 where id = :reservationId
                   and status = 'PAYMENT_PENDING'
+                  and (payment_id is null or payment_id = :paymentId)
                 """,
                 new MapSqlParameterSource()
                         .addValue("reservationId", reservationId)
@@ -434,6 +435,7 @@ public class BookingRepository {
     }
 
     public void bookSeats(UUID reservationId) {
+        lockHeldSeats(List.of(reservationId));
         jdbc.update(
                 """
                 update seats
@@ -475,6 +477,7 @@ public class BookingRepository {
                     updated_at = now()
                 where id = :reservationId
                   and status = 'PAYMENT_PENDING'
+                  and (payment_id is null or payment_id = :paymentId)
                 """,
                 new MapSqlParameterSource()
                         .addValue("reservationId", reservationId)
@@ -493,6 +496,7 @@ public class BookingRepository {
                     updated_at = now()
                 where id = :reservationId
                   and status = 'PAYMENT_PENDING'
+                  and (payment_id is null or payment_id = :paymentId)
                 """,
                 new MapSqlParameterSource()
                         .addValue("reservationId", reservationId)
@@ -540,6 +544,7 @@ public class BookingRepository {
         MapSqlParameterSource params = new MapSqlParameterSource()
                 .addValue("reservationIds", reservationIds);
 
+        lockHeldSeats(reservationIds);
         jdbc.update(
                 """
                 update seats
@@ -550,6 +555,20 @@ public class BookingRepository {
                   and status = 'HELD'
                 """,
                 params);
+    }
+
+    private void lockHeldSeats(List<UUID> reservationIds) {
+        jdbc.query(
+                """
+                select id
+                from seats
+                where reservation_id in (:reservationIds)
+                  and status = 'HELD'
+                order by id
+                for update
+                """,
+                Map.of("reservationIds", reservationIds),
+                UUID_ROW_MAPPER);
     }
 
     private void requireSingleUpdate(int updated, String message) {

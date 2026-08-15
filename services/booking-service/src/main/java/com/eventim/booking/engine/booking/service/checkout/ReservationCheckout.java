@@ -123,6 +123,7 @@ public class ReservationCheckout {
 
         ReservationRow reservation = bookingRepository.lockReservation(checkout.reservationId());
         ensureStoredCheckout(reservation, checkout);
+        ensureSamePaymentId(reservation, payment);
         boolean paymentMatches = paymentMatchesCheckout(checkout, payment);
 
         switch (payment.status()) {
@@ -379,6 +380,14 @@ public class ReservationCheckout {
         if (!checkout.reservationId().equals(payment.reservationId())) {
             throw new ExternalServiceException(
                     "Payment service returned a result for another reservation");
+        }
+    }
+
+    private void ensureSamePaymentId(ReservationRow reservation, PaymentResult payment) {
+        if (reservation.paymentId() != null
+                && !reservation.paymentId().equals(payment.paymentId())) {
+            throw new ExternalServiceException(
+                    "Payment service returned a different payment for this reservation");
         }
     }
 

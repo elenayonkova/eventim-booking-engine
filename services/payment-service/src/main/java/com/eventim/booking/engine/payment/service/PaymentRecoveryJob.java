@@ -9,8 +9,8 @@ import org.springframework.transaction.annotation.Transactional;
 import com.eventim.booking.engine.payment.repository.PaymentRepository;
 
 /**
- * Periodically marks abandoned processing payments as failed so callers can
- * reconcile requests interrupted before their completion transition.
+ * Periodically marks abandoned provider operations as unresolved so callers do
+ * not mistake an unknown external outcome for a failure or cancellation.
  */
 @Component
 public class PaymentRecoveryJob {
@@ -23,12 +23,11 @@ public class PaymentRecoveryJob {
 
     @Scheduled(fixedDelayString = "${payment.recovery-sweep-ms}")
     @Transactional
-    public void failInterruptedPayments() {
+    public void recoverInterruptedOperations() {
         Duration timeout = Duration.ofMinutes(2);
-        // FUTURE PROVIDER CALL: query the provider for stale payment and refund
-        // outcomes outside a database transaction before applying recovered states.
-        // The simulator can only mark interrupted local attempts as failed.
-        paymentRepository.failStaleProcessingPayments(timeout);
+        // A real provider integration can later reconcile UNKNOWN rows by the
+        // durable payment ID. Until then, an unknown outcome must stay non-terminal.
+        paymentRepository.markStalePaymentsUnknown(timeout);
         paymentRepository.failStaleProcessingRefunds(timeout);
     }
 }

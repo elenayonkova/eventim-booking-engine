@@ -154,6 +154,28 @@ class ReservationCheckoutTest {
     }
 
     @Test
+    void paymentWithDifferentIdThanTheRecordedPaymentIsRejected() {
+        UUID reservationId = UUID.randomUUID();
+        UUID recordedPaymentId = UUID.randomUUID();
+        ReservationRow pending = checkoutReservation(
+                reservationId,
+                recordedPaymentId,
+                ReservationStatus.PAYMENT_PENDING,
+                OffsetDateTime.now());
+        CheckoutSnapshot checkout = CheckoutSnapshot.from(pending);
+        when(bookingRepository.lockReservation(reservationId)).thenReturn(pending);
+
+        assertThatThrownBy(() -> reservationCheckout.applyPaymentResult(
+                checkout,
+                payment(UUID.randomUUID(), reservationId, PaymentStatus.SUCCEEDED)))
+                .isInstanceOf(ExternalServiceException.class)
+                .hasMessageContaining("different payment");
+
+        verify(bookingRepository).lockReservation(reservationId);
+        verifyNoMoreInteractions(bookingRepository);
+    }
+
+    @Test
     void paymentPendingCheckoutIsTimedOutAtTheExactBoundary() {
         UUID reservationId = UUID.randomUUID();
         OffsetDateTime checkoutStartedAt = OffsetDateTime.now();

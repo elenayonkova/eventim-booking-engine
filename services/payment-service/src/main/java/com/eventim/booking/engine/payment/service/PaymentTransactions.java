@@ -234,7 +234,7 @@ public class PaymentTransactions {
 
     private PaymentResponse toResponse(PaymentRecord payment) {
         PaymentStatus responseStatus = switch (payment.status()) {
-            case CANCELLATION_PENDING -> PaymentStatus.PROCESSING;
+            case CANCELLATION_PENDING, UNKNOWN -> PaymentStatus.PROCESSING;
             case CANCELLED -> PaymentStatus.FAILED;
             default -> payment.status();
         };

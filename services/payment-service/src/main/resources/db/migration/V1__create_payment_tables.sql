@@ -8,6 +8,7 @@ create table payments (
         status in (
             'PROCESSING',
             'CANCELLATION_PENDING',
+            'UNKNOWN',
             'CANCELLED',
             'SUCCEEDED',
             'FAILED',

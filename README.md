@@ -66,11 +66,15 @@ charge. Only `REFUND_REQUIRED` triggers a second external operation.
 | New | `PROCESSING` | Charge starts |
 | New | `CANCELLED` | Cancellation arrives before a charge |
 | `PROCESSING` | `SUCCEEDED` | Provider confirms the charge |
-| `PROCESSING` | `FAILED` | Provider rejects the charge or recovery times out |
+| `PROCESSING` | `FAILED` | Provider rejects the charge |
+| `PROCESSING`, `CANCELLATION_PENDING` | `UNKNOWN` | Local completion is interrupted and provider outcome is unknown |
 | `PROCESSING` | `CANCELLATION_PENDING` | Cancellation races the charge |
 | `CANCELLATION_PENDING` | `CANCELLED` | Cancellation wins |
 | `CANCELLATION_PENDING` | `SUCCEEDED` | Charge wins |
 | `SUCCEEDED` | `REFUNDED` | Refund succeeds |
+
+`UNKNOWN` is exposed to callers as `PROCESSING` and remains non-terminal until
+the provider outcome can be reconciled; timeout alone never implies failure.
 
 Refunds follow `New → PROCESSING → SUCCEEDED/FAILED`; retry moves `FAILED` back
 to `PROCESSING` on the same row with the same refund ID.
@@ -126,8 +130,7 @@ docker compose up --build
 
 The smoke test verifies health, atomic holds, overlap conflicts, successful and
 failed checkout, idempotent retry, cancellation tombstones, seat release, and a
-failed refund retried successfully with the same ID. A verified run is in
-[demo/smoke-test-output.txt](demo/smoke-test-output.txt).
+failed refund retried successfully with the same ID.
 
 The Flyway V1 seed creates `event-1` with currency `EUR` and twenty seats priced
 at `5000` minor units each. Therefore, holding two demo seats produces a
@@ -174,18 +177,16 @@ Testcontainers.
 mvn test
 ```
 
-The 58 tests cover high-contention seat allocation, all-or-nothing multi-seat
+The 60 tests cover high-contention seat allocation, all-or-nothing multi-seat
 holds, expiry commits, reservation price snapshots, checkout states,
 idempotency, cancellation/payment races, late completions, and refund retries.
 
 ## Demo
 
-- [Five-minute recorded walkthrough](demo/eventim-booking-engine-demo.mp4)
-- Shared download after pushing:
-  `https://github.com/elenayonkova/eventim-booking-engine/raw/main/demo/eventim-booking-engine-demo.mp4`
-
 ## Exercise scope
 
 Customers are anonymous, the provider is simulated, public hosting and database
 partitioning are not required, and correctness under concurrency is prioritized
-over a fixed throughput target.
+over a fixed throughput target. Reservation creation does not take a
+customer-scoped idempotency key because users and authentication are out of
+scope; checkout and payment retries are idempotent.

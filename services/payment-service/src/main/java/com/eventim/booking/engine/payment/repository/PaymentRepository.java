@@ -338,19 +338,12 @@ public class PaymentRepository {
         return findRefundById(refundId);
     }
 
-    public int failStaleProcessingPayments(Duration timeout) {
+    public int markStalePaymentsUnknown(Duration timeout) {
         return jdbc.update(
                 """
                 update payments
-                set status = case
-                        when status = 'CANCELLATION_PENDING' then 'CANCELLED'
-                        else 'FAILED'
-                    end,
-                    failure_reason = case
-                        when status = 'CANCELLATION_PENDING'
-                            then 'Payment cancellation recovery timed out'
-                        else 'Payment processing was interrupted'
-                    end,
+                set status = 'UNKNOWN',
+                    failure_reason = 'Payment provider outcome is unknown; reconciliation required',
                     updated_at = now()
                 where status in ('PROCESSING', 'CANCELLATION_PENDING')
                   and updated_at <= now() - (:timeoutSeconds * interval '1 second')
