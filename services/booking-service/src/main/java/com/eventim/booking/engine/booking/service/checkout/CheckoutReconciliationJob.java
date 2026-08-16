@@ -5,8 +5,8 @@ import org.springframework.stereotype.Component;
 
 /**
  * Reconciles checkout work that outlived the initiating HTTP request. Missing
- * payments expire and release their seats; durable payment and refund results
- * are applied idempotently.
+ * missing payments release their seats but remain tracked for a late outcome;
+ * durable payment and refund results are applied idempotently.
  */
 @Component
 public class CheckoutReconciliationJob {

@@ -83,7 +83,7 @@ public class ReservationCheckout {
     }
 
     @Transactional
-    public void expireMissingPayment(CheckoutSnapshot checkout) {
+    public void releaseInventoryForMissingPayment(CheckoutSnapshot checkout) {
         ReservationRow reservation = bookingRepository.lockReservation(checkout.reservationId());
         ensureStoredCheckout(reservation, checkout);
         if (reservation.status() != ReservationStatus.PAYMENT_PENDING) {
@@ -93,7 +93,7 @@ public class ReservationCheckout {
             throw new ConflictException(
                     "Reservation has a recorded payment that cannot be discarded");
         }
-        bookingRepository.expirePaymentPendingWithoutPayment(reservation.id());
+        bookingRepository.releaseSeatsWhileAwaitingLatePayment(reservation.id());
     }
 
     @Transactional
@@ -342,7 +342,8 @@ public class ReservationCheckout {
     ) {
         if (reservation.checkoutAmount() != checkout.amount()
                 || !reservation.checkoutCurrency().equals(checkout.currency())
-                || !reservation.paymentMethodTokenDigest().equals(
+                || !Objects.equals(
+                        reservation.paymentMethodTokenDigest(),
                         checkout.paymentMethodTokenDigest())) {
             throw new ConflictException("Reservation checkout price changed unexpectedly");
         }

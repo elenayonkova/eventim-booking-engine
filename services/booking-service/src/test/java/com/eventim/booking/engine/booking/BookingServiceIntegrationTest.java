@@ -378,7 +378,7 @@ class BookingServiceIntegrationTest {
     }
 
     @Test
-    void reconciliationExpiresAReservationWhenNoPaymentWasCreated() {
+    void reconciliationReleasesSeatsWhileAwaitingALatePayment() {
         ReservationResponse reservation = bookingService.createReservation(
                 new CreateReservationRequest("event-1", List.of("A-1")));
         ChargePayment command = new ChargePayment(
@@ -407,7 +407,7 @@ class BookingServiceIntegrationTest {
         assertThat(jdbc.queryForObject(
                 "select status from booking.reservations where id = ?",
                 String.class,
-                reservation.reservationId())).isEqualTo("EXPIRED");
+                reservation.reservationId())).isEqualTo("PAYMENT_PENDING");
         assertThat(jdbc.queryForObject(
                 "select status from booking.seats where seat_label = 'A-1'",
                 String.class)).isEqualTo("AVAILABLE");
@@ -415,6 +415,82 @@ class BookingServiceIntegrationTest {
                 "select count(*) from booking.reservation_seats where reservation_id = ?",
                 Integer.class,
                 reservation.reservationId())).isEqualTo(1);
+    }
+
+    @Test
+    void lateSuccessfulPaymentAfterMissingLookupIsRefunded() throws Exception {
+        ReservationResponse reservation = bookingService.createReservation(
+                new CreateReservationRequest("event-1", List.of("A-1")));
+        UUID paymentId = UUID.randomUUID();
+        UUID refundId = UUID.randomUUID();
+        CountDownLatch chargeStarted = new CountDownLatch(1);
+        CountDownLatch completeCharge = new CountDownLatch(1);
+        ChargePayment command = new ChargePayment(
+                reservation.reservationId(),
+                5_000,
+                "EUR",
+                "pm-late",
+                new PaymentSimulation(null, null));
+        org.mockito.Mockito.when(paymentGateway.charge(command)).thenAnswer(invocation -> {
+            chargeStarted.countDown();
+            completeCharge.await();
+            return new PaymentResult(
+                    paymentId,
+                    reservation.reservationId(),
+                    5_000,
+                    "EUR",
+                    tokenDigest("pm-late"),
+                    PaymentStatus.SUCCEEDED,
+                    null);
+        });
+        org.mockito.Mockito.when(paymentGateway.findPayment(reservation.reservationId()))
+                .thenReturn(Optional.empty());
+        org.mockito.Mockito.when(paymentGateway.refund(reservation.reservationId()))
+                .thenReturn(new RefundResult(
+                        refundId,
+                        reservation.reservationId(),
+                        paymentId,
+                        RefundStatus.SUCCEEDED));
+
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        try {
+            Future<CheckoutResponse> lateCheckout = executor.submit(() ->
+                    checkoutService.completeCheckout(
+                            new CheckoutRequest(reservation.reservationId(), "pm-late"),
+                            null,
+                            null));
+            chargeStarted.await();
+            jdbc.update(
+                    "update booking.reservations set payment_started_at = now() - interval '10 minutes' "
+                            + "where id = ?",
+                    reservation.reservationId());
+
+            checkoutService.reconcilePendingPayments();
+
+            assertThat(jdbc.queryForObject(
+                    "select status from booking.reservations where id = ?",
+                    String.class,
+                    reservation.reservationId())).isEqualTo("PAYMENT_PENDING");
+            assertThat(jdbc.queryForObject(
+                    "select status from booking.seats where seat_label = 'A-1'",
+                    String.class)).isEqualTo("AVAILABLE");
+
+            completeCharge.countDown();
+            CheckoutResponse response = lateCheckout.get();
+
+            assertThat(response.status()).isEqualTo(ReservationStatus.REFUNDED);
+            assertThat(jdbc.queryForObject(
+                    "select status from booking.reservations where id = ?",
+                    String.class,
+                    reservation.reservationId())).isEqualTo("REFUNDED");
+            assertThat(jdbc.queryForObject(
+                    "select status from booking.seats where seat_label = 'A-1'",
+                    String.class)).isEqualTo("AVAILABLE");
+            org.mockito.Mockito.verify(paymentGateway).refund(reservation.reservationId());
+        } finally {
+            completeCharge.countDown();
+            executor.shutdownNow();
+        }
     }
 
     @Test

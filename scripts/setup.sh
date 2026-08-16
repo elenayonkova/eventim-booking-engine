@@ -53,7 +53,8 @@ deployment_image() {
   local deployment_name="$1"
   local container_name="$2"
 
-  ytt -f "${rendered_workloads_file}" -o json \
+  # Read from stdin because the mktemp path has no YAML extension for ytt to detect.
+  ytt -f - -o json <"${rendered_workloads_file}" \
     | jq --slurp --raw-output \
       --arg deployment "${deployment_name}" \
       --arg container "${container_name}" \

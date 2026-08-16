@@ -530,23 +530,22 @@ public class BookingRepository {
         requireSingleUpdate(updated, "Reservation could not be marked refunded: " + reservationId);
     }
 
-    public void expirePaymentPendingWithoutPayment(UUID reservationId) {
+    public void releaseSeatsWhileAwaitingLatePayment(UUID reservationId) {
         releaseHeldSeats(reservationId);
         int updated = jdbc.update(
                 """
                 update reservations
-                set status = 'EXPIRED',
-                    payment_id = null,
-                    payment_method_token_digest = null,
-                    payment_started_at = null,
-                    payment_failure_reason = 'Payment was never created',
+                set payment_started_at = now(),
+                    payment_failure_reason = 'Payment was not observed; seats released while awaiting a late outcome',
                     updated_at = now()
                 where id = :reservationId
                   and status = 'PAYMENT_PENDING'
                   and payment_id is null
                 """,
                 Map.of("reservationId", reservationId));
-        requireSingleUpdate(updated, "Pending reservation could not be expired: " + reservationId);
+        requireSingleUpdate(
+                updated,
+                "Pending reservation could not release its seats safely: " + reservationId);
     }
 
     public void expireHeldReservation(UUID reservationId) {

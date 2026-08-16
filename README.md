@@ -59,7 +59,7 @@ curl -sS http://localhost:8080/v1/events/event-1/seats | jq
 reservation=$(curl -sS --fail-with-body \
   -X POST http://localhost:8080/v1/reservations \
   -H 'Content-Type: application/json' \
-  -d '{"eventId":"event-1","seatIds":["00000000-0000-0000-0000-000000000101"]}')
+  -d '{"eventId":"event-1","seatIds":["A-1"]}')
 
 reservation_id=$(jq -r '.reservationId' <<<"$reservation")
 
@@ -112,24 +112,21 @@ fencing.
 
 ## Design decisions and scope
 
-- `reservation_seats` preserves the reservation's seat history.
-  `seats.reservation_id` is the current ownership pointer used for fast
-  availability checks. Both change in the same transaction.
-- A payment ID is committed before provider I/O and reused as the provider
-  idempotency key. One caller or scheduled job can claim a stale attempt;
-  attempt numbers prevent late results from overwriting newer ones.
-- Booking Service reconciles old `PAYMENT_PENDING` reservations. It applies a
-  terminal payment, expires a reservation if no payment exists, or requests a
-  compensating refund if a successful charge cannot be booked safely.
-- The simulated payment token is retained only while recovery is pending and
-  cleared on a terminal result. A real integration should store an encrypted
-  provider reference instead.
-- Customers and authentication are out of scope, so reservation creation has
-  no customer-scoped idempotency key. Public hosting, database partitioning,
-  and a fixed throughput target are also out of scope.
-- The simulated provider blocks the request thread while adding artificial
-  delay. A real integration should use secure HTTPS, strict timeouts, and
-  bounded concurrency.
+- `reservation_seats` keeps seat history, while `seats.reservation_id` shows the
+  current owner. Both are updated in one transaction.
+- Payment IDs are stored before provider calls and used as idempotency keys.
+  Stale attempts are retried, and late results cannot overwrite newer ones.
+- Booking Service keeps checking old `PAYMENT_PENDING` reservations. If no
+  payment appears, it releases the seats but keeps the reservation pending so a
+  late successful charge can still be detected and refunded.
+- The simulated payment token is stored only while recovery is needed and is
+  cleared when processing finishes.
+- The provider is always simulated, and artificial delays block the request
+  thread. A real integration would use HTTPS, strict timeouts, encrypted
+  provider references, and bounded concurrency.
+- Customers, authentication, public hosting, database partitioning, and a fixed
+  throughput target are out of scope. Reservations therefore have no
+  customer-scoped idempotency key.
 
 Database schemas:
 

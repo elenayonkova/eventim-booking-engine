@@ -128,7 +128,7 @@ public class CheckoutService {
 
         Optional<PaymentResult> payment = paymentGateway.findPayment(reservationId);
         if (payment.isEmpty()) {
-            reservationCheckout.expireMissingPayment(checkout);
+            reservationCheckout.releaseInventoryForMissingPayment(checkout);
             return;
         }
         applyPaymentResult(checkout, payment.get());

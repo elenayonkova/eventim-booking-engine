@@ -125,7 +125,7 @@ class CheckoutServiceTest {
     }
 
     @Test
-    void missingPaymentExpiresThePendingReservation() {
+    void missingPaymentReleasesInventoryWhileKeepingReconciliationPending() {
         UUID reservationId = UUID.randomUUID();
         CheckoutSnapshot pending = pendingCheckout(reservationId);
         Duration timeout = Duration.ofSeconds(90);
@@ -137,7 +137,7 @@ class CheckoutServiceTest {
 
         checkoutService.reconcilePendingPayments();
 
-        verify(reservationCheckout).expireMissingPayment(pending);
+        verify(reservationCheckout).releaseInventoryForMissingPayment(pending);
     }
 
     @Test
@@ -161,7 +161,7 @@ class CheckoutServiceTest {
         checkoutService.reconcilePendingPayments();
 
         verify(reservationCheckout).applyPaymentResult(pending, succeeded);
-        verify(reservationCheckout, never()).expireMissingPayment(any());
+        verify(reservationCheckout, never()).releaseInventoryForMissingPayment(any());
     }
 
     private CheckoutSnapshot pendingCheckout(UUID reservationId) {
