@@ -142,4 +142,4 @@ Database schemas:
 
 ## Demo
 
-Demo link: _to be added._
+[Watch the recorded demo](demo.mp4).
