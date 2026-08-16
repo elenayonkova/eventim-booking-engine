@@ -171,7 +171,7 @@ public class BookingRepository {
                 select seat_label, status, reservation_id, hold_expires_at
                 from seats
                 where event_id = :eventId
-                order by seat_label
+                order by id
                 """,
                 Map.of("eventId", eventId),
                 SEAT_AVAILABILITY_ROW_MAPPER);

@@ -34,6 +34,7 @@ import com.eventim.booking.engine.booking.api.CheckoutRequest;
 import com.eventim.booking.engine.booking.api.CheckoutResponse;
 import com.eventim.booking.engine.booking.api.CreateReservationRequest;
 import com.eventim.booking.engine.booking.api.ReservationResponse;
+import com.eventim.booking.engine.booking.api.SeatAvailabilityResponse;
 import com.eventim.booking.engine.booking.domain.ReservationStatus;
 import com.eventim.booking.engine.booking.payment.ChargePayment;
 import com.eventim.booking.engine.booking.payment.PaymentGateway;
@@ -143,6 +144,17 @@ class BookingServiceIntegrationTest {
         assertThat(jdbc.queryForObject(
                 "select status from booking.seats where seat_label = 'A-3'",
                 String.class)).isEqualTo("AVAILABLE");
+    }
+
+    @Test
+    void seatsAreReturnedInInventoryOrder() {
+        assertThat(bookingService.getSeats("event-1").seats())
+                .extracting(SeatAvailabilityResponse.Seat::seatId)
+                .containsExactly(
+                        "A-1", "A-2", "A-3", "A-4", "A-5",
+                        "A-6", "A-7", "A-8", "A-9", "A-10",
+                        "B-1", "B-2", "B-3", "B-4", "B-5",
+                        "B-6", "B-7", "B-8", "B-9", "B-10");
     }
 
     @Test
